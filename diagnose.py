@@ -86,6 +86,42 @@ def load_parser():
     return G
 
 
+# This script reads things a newer generate_doc.py provides. Rather than
+# crashing halfway through on an older copy, missing pieces are reported once
+# and the rest of the diagnostic still runs.
+EXPECTED_ATTRS = (
+    "stage_object", "RECORD_TYPES_IGNORED", "REFERENCE_CONSUMER_HINTS",
+    "RECORD_TYPES_JOB", "RECORD_TYPES_STAGE", "RECORD_TYPES_INPUT",
+    "RECORD_TYPES_OUTPUT", "RECORD_TYPES_ANNOTATION",
+)
+
+
+def check_version(G) -> list[str]:
+    missing = [a for a in EXPECTED_ATTRS if not hasattr(G, a)]
+    if missing:
+        out("")
+        out(" NOTE: the generate_doc.py in use is older than this script.")
+        out(f"       missing: {', '.join(missing)}")
+        out("       Copy the latest generate_doc.py over; those checks are skipped.")
+        out(f"       module file: {getattr(G, '__file__', 'unknown')}")
+    return missing
+
+
+def safe_object(G, stage):
+    """stage_object() where available, else the old flat-property lookup."""
+    fn = getattr(G, "stage_object", None)
+    if fn is not None:
+        try:
+            return fn(stage)
+        except Exception as exc:
+            return f"(error: {exc})"
+    for key in ("TableName", "FileName", "Filename", "SelectStatement", "Query"):
+        value = stage.properties.get(key)
+        if value:
+            return value
+    return None
+
+
 def tag(el) -> str:
     return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
 
@@ -112,6 +148,7 @@ def main() -> int:
         return 1
 
     G = load_parser()
+    check_version(G)
     from lxml import etree
 
     record_types: Counter = Counter()
@@ -165,9 +202,13 @@ def main() -> int:
             problems.append(f"{path.name}: parser failed ({exc})")
             continue
 
-        recs = sum(len(j.all_records) for j in jobs)
         for job in jobs:
-            g = G.analyze(job)
+            try:
+                g = G.analyze(job)
+            except Exception as exc:
+                out(f" {name:<30} ANALYSIS FAILED  {type(exc).__name__}: {exc}")
+                problems.append(f"{path.name}: analysis failed ({exc})")
+                continue
             out(f" {name:<30}{len(jobs):>4}{len(job.all_records):>5}{len(g.stages):>5}"
                 f"{len(g.links):>5}{len(g.sources):>4}{len(g.references):>4}"
                 f"{len(g.transformations):>4}{len(g.targets):>4}{len(g.data_objects):>4}"
@@ -192,15 +233,17 @@ def main() -> int:
                              if v and v.lstrip().startswith("<")]
                     object_report.append(
                         (stage.display_name, stage.display_type, stage.role,
-                         G.stage_object(stage),
+                         safe_object(G, stage),
                          sorted(k for k, v in stage.properties.items() if v),
                          blobs, stage.properties))
 
     # ------------------------------------------------------------- aggregates
     head("RECORD TYPES ACROSS ALL FILES")
-    handled = (G.RECORD_TYPES_JOB | G.RECORD_TYPES_STAGE | G.RECORD_TYPES_INPUT
-               | G.RECORD_TYPES_OUTPUT | G.RECORD_TYPES_ANNOTATION
-               | G.RECORD_TYPES_IGNORED)
+    handled: set = set()
+    for attr in ("RECORD_TYPES_JOB", "RECORD_TYPES_STAGE", "RECORD_TYPES_INPUT",
+                 "RECORD_TYPES_OUTPUT", "RECORD_TYPES_ANNOTATION",
+                 "RECORD_TYPES_IGNORED"):
+        handled |= set(getattr(G, attr, ()) or ())
     wrap("handled", [f"{k} {v}" for k, v in record_types.most_common() if k in handled])
     unknown = [f"{k} {v}" for k, v in record_types.most_common() if k not in handled]
     if unknown:
@@ -212,7 +255,8 @@ def main() -> int:
 
     head("STAGE TYPES ACROSS ALL FILES")
     wrap("types", [f"{k} {v}" for k, v in stage_types.most_common(24)])
-    lookups = [k for k in stage_types if any(h in k.lower() for h in G.REFERENCE_CONSUMER_HINTS)]
+    hints = getattr(G, "REFERENCE_CONSUMER_HINTS", ("lookup",))
+    lookups = [k for k in stage_types if any(h in k.lower() for h in hints)]
     out(f" treated as reference consumers: {', '.join(lookups) or 'none'}")
     joins = [k for k in stage_types if "join" in k.lower() or "merge" in k.lower()]
     if joins:

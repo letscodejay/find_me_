@@ -1038,6 +1038,67 @@ def _interesting_properties(stage: Stage, limit: int = 8) -> dict[str, str]:
     return out
 
 
+# What a source or target reads from or writes to. Flat properties are checked
+# first; modern connector stages (Snowflake, JDBC, ODBC) instead nest their
+# configuration inside an XML blob, so that is searched next.
+OBJECT_PROPERTY_CANDIDATES = (
+    "TableName", "Table_name", "TableNameInput", "Table", "TargetTable",
+    "FileName", "Filename", "File", "FilePath", "Path", "Directory",
+    "SelectStatement", "Select_Statement", "SQLStatement", "SQL", "Query",
+    "Source", "DataSource", "DSN", "DatabaseName", "SchemaName",
+)
+# Tag names to look for inside a connector's nested XML configuration.
+OBJECT_XML_TAGS = (
+    "TableName", "Table", "SelectStatement", "SQL", "Query", "FileName",
+    "File", "Path", "Schema", "TargetTable",
+)
+XML_BLOB_PROPERTY_HINTS = ("XMLProperties", "Properties", "StageProperties", "Config")
+
+
+def stage_object(stage: Stage) -> str | None:
+    """The table, file or query a stage reads from or writes to, if recorded."""
+    flat = stage.prop(*OBJECT_PROPERTY_CANDIDATES)
+    if flat:
+        return _tidy_object(flat)
+
+    # Connector stages nest their configuration in an XML string.
+    for key, value in stage.properties.items():
+        if not value or "<" not in value:
+            continue
+        if not (any(h.lower() in key.lower() for h in XML_BLOB_PROPERTY_HINTS)
+                or value.lstrip().startswith("<")):
+            continue
+        found = _search_xml_blob(value)
+        if found:
+            return _tidy_object(found)
+    return None
+
+
+def _search_xml_blob(blob: str) -> str | None:
+    try:
+        from lxml import etree
+        root = etree.fromstring(blob.encode("utf-8", "ignore"),
+                                etree.XMLParser(recover=True))
+    except Exception:
+        return None
+    if root is None:
+        return None
+    wanted = {t.lower() for t in OBJECT_XML_TAGS}
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
+        if tag.lower() in wanted:
+            text = "".join(el.itertext()).strip()
+            if text:
+                return text
+    return None
+
+
+def _tidy_object(text: str) -> str:
+    """Collapse a multi-line SQL statement so it fits a table cell."""
+    text = " ".join(text.split())
+    return text if len(text) <= 160 else text[:159] + "\u2026"
+
+
 def _name_of(graph: WorkflowGraph, stage_id: str) -> str:
     for s in graph.stages:
         if s.identifier == stage_id:
@@ -1351,17 +1412,19 @@ def _diagram_is_usable(diagram: str, graph: WorkflowGraph) -> bool:
     return present >= max(1, int(len(named) * 0.75))
 
 
-def build_arrow_diagram(graph: WorkflowGraph) -> str:
+def build_arrow_diagram(graph: WorkflowGraph, width_in: float | None = None) -> str:
     """
     Deterministic fallback layout, used when the model is unavailable or its
     diagram fails validation, so Section 3 always carries a figure.
 
-    One line per stage in execution order, listing what it feeds. An indented
-    tree was tried first and rejected: indentation implies a parent, so a target
-    drawn under a sibling branch reads as being fed by it.
+    One line per link, in execution order. Grouping a stage's targets onto one
+    line was tried first and rejected: a stage feeding four others produced a
+    170-character line, which no legible font could fit, and the whole figure was
+    dropped. A line per link is never wider than two names.
+
+    Long names are shortened to fit rather than losing the figure altogether.
     """
-    stages = [s for s in graph.stages if s.role != ROLE_UNCLASSIFIED]
-    if not stages or len(stages) > MAX_STAGES_FOR_DIAGRAM:
+    if not graph.links or len(graph.stages) > MAX_STAGES_FOR_DIAGRAM:
         return ""
 
     depth: dict[str, int] = {}
@@ -1375,27 +1438,41 @@ def build_arrow_diagram(graph: WorkflowGraph) -> str:
         depth[stage_id] = d
         return d
 
-    for s in stages:
-        compute(s.identifier, frozenset())
-    ordered = sorted(stages, key=lambda s: (depth.get(s.identifier, 0), s.display_name))
+    for stage in graph.stages:
+        compute(stage.identifier, frozenset())
 
-    name_w = max(len(s.display_name) for s in ordered)
-    role_w = max(len(ROLE_LABELS.get(s.role, "")) for s in ordered) + 2
+    ordered = sorted(
+        graph.links,
+        key=lambda l: (depth.get(l.from_stage, 0), _name_of(graph, l.from_stage),
+                       _name_of(graph, l.to_stage)),
+    )
+    rows = [
+        (_name_of(graph, l.from_stage), _name_of(graph, l.to_stage), l.is_reference)
+        for l in ordered
+    ]
 
-    lines: list[str] = []
-    for s in ordered:
-        outgoing = graph.outgoing(s)
-        if outgoing:
-            feeds = ", ".join(
-                _name_of(graph, l.to_stage) + (" (reference)" if l.is_reference else "")
-                for l in outgoing
-            )
-            arrow = f"--> {feeds}"
-        else:
-            arrow = "--| end of flow"
-        role = f"[{ROLE_LABELS.get(s.role, '').lower()}]"
-        lines.append(f"{s.display_name:<{name_w}}  {role:<{role_w}}  {arrow}")
-    return "\n".join(lines)
+    marker = "  (reference)"
+    arrow = "  -->  "
+    usable = (width_in or CONTENT_WIDTH_IN) - 0.25
+    budget = int(72 * usable / (MONO_CHAR_WIDTH_RATIO * DIAGRAM_MIN_FONT))
+
+    name_w = max(len(a) for a, _, _ in rows)
+    longest = max(name_w + len(arrow) + len(b) + (len(marker) if r else 0)
+                  for _, b, r in rows for a in [""])
+    # Shorten names only as far as necessary, and only if necessary.
+    allowed = budget - len(arrow) - len(marker)
+    if longest > budget and allowed >= 16:
+        limit = max(8, allowed // 2)
+        rows = [(_ellipsize(a, limit), _ellipsize(b, limit), r) for a, b, r in rows]
+        name_w = max(len(a) for a, _, _ in rows)
+
+    return "\n".join(
+        f"{a:<{name_w}}{arrow}{b}{marker if r else ''}" for a, b, r in rows
+    )
+
+
+def _ellipsize(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
 def _validate_narrative(narrative: Narrative, graph: WorkflowGraph) -> list[str]:
@@ -2180,7 +2257,8 @@ class DocxBuilder:
         self._heading("Section 3", SECTION_TITLES[3])
         fitted = fit_diagram(self.narrative.architecture_diagram, self.content_width)
         if fitted is None:
-            fitted = fit_diagram(build_arrow_diagram(self.graph), self.content_width)
+            fitted = fit_diagram(build_arrow_diagram(self.graph, self.content_width),
+                                 self.content_width)
         if fitted:
             diagram, size = fitted
             self._monospace_block(diagram, size)
@@ -2203,7 +2281,7 @@ class DocxBuilder:
         self._heading("Section 4", SECTION_TITLES[4])
         rows = []
         for s in self.graph.sources:
-            obj = s.prop("TableName", "FileName", "Filename", "SelectStatement", "Query")
+            obj = stage_object(s)
             out_links = ", ".join(s.outputs) or TEXT_NOT_APPLICABLE
             rows.append([
                 s.display_name, s.identifier, s.display_type,
@@ -2266,7 +2344,7 @@ class DocxBuilder:
         self._heading("Section 7", SECTION_TITLES[7])
         rows = []
         for s in self.graph.targets:
-            obj = s.prop("TableName", "FileName", "Filename")
+            obj = stage_object(s)
             mode = s.prop("WriteMode", "WriteMethod", "UpdateAction")
             rows.append([
                 s.display_name, s.identifier, s.display_type,
@@ -2298,7 +2376,7 @@ class DocxBuilder:
         if not rows:
             rows = [[(TEXT_NOT_APPLICABLE, "na"), "", "", ""]]
         self._table(
-            ["#", "Path", "Stages", "Explanation"],
+            ["#", "Path", "Stages in path", "Explanation"],
             rows,
             [0.32, 2.35, 0.50, self.content_width - 3.17],
             mono_columns=[0, 1, 2], desc_columns=[3],
