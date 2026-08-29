@@ -225,6 +225,10 @@ MAX_PATHS = 200                     # stop enumerating beyond this
 MAX_PATH_DEPTH = 50
 MAX_STAGES_FOR_DIAGRAM = 25         # wider workflows omit Figure 1
 
+# --- Output -------------------------------------------------------------------
+# Used when the caller does not pass one - the Flask route often does not.
+DEFAULT_OUTPUT_DIR = "reports"
+
 # --- Conversion ---------------------------------------------------------------
 KEEP_INTERMEDIATE_DOCX = False      # True leaves the .docx next to the .pdf
 PDF_CONVERSION_TIMEOUT_SECONDS = 300
@@ -2254,6 +2258,21 @@ def _safe_name(text: str) -> str:
     return _SAFE_NAME_RE.sub("_", text).strip("_") or "report"
 
 
+def _unique_stem(stem: str, used: set[str]) -> str:
+    """
+    Two uploads can carry the same filename, and two files in different folders
+    can share a stem. Without this the second report overwrites the first on
+    disk and shadows it inside the ZIP.
+    """
+    candidate = stem
+    n = 2
+    while candidate.lower() in used:
+        candidate = f"{stem}_{n}"
+        n += 1
+    used.add(candidate.lower())
+    return candidate
+
+
 def build_report(job: ParsedJob, out_dir: Path, stem: str) -> Path:
     """Analyse one job, write the .docx, convert it, and return the .pdf path."""
     graph = analyze(job)
@@ -2282,11 +2301,14 @@ def build_report(job: ParsedJob, out_dir: Path, stem: str) -> Path:
     return pdf_path
 
 
-def build_reports_for_file(xml_path: Path, out_dir: Path) -> list[Path]:
+def build_reports_for_file(
+    xml_path: Path, out_dir: Path, used_names: set[str] | None = None
+) -> list[Path]:
     """
     One PDF per job. A file holding several jobs produces several reports rather
     than silently documenting the first one.
     """
+    used_names = used_names if used_names is not None else set()
     jobs = DataStageParser(xml_path).parse_all_jobs()
     stem = _safe_name(xml_path.stem)
     pdfs: list[Path] = []
@@ -2298,8 +2320,8 @@ def build_reports_for_file(xml_path: Path, out_dir: Path) -> list[Path]:
                 xml_path.name, job.job_name,
             )
             continue
-        name = stem if len(jobs) == 1 else f"{stem}__{_safe_name(job.job_name)}"
-        pdfs.append(build_report(job, out_dir, name))
+        base = stem if len(jobs) == 1 else f"{stem}__{_safe_name(job.job_name)}"
+        pdfs.append(build_report(job, out_dir, _unique_stem(base, used_names)))
 
     return pdfs
 
@@ -2316,11 +2338,12 @@ def generate(inputs: Sequence[str | Path], out_dir: str | Path) -> Path:
 
     pdfs: list[Path] = []
     failures: list[str] = []
+    used_names: set[str] = set()
 
     for raw in inputs:
         path = Path(raw)
         try:
-            pdfs.extend(build_reports_for_file(path, out_dir))
+            pdfs.extend(build_reports_for_file(path, out_dir, used_names))
         except ParseError as exc:
             failures.append(f"{path.name}: {exc}")
             log.error("%s", exc)
@@ -2352,6 +2375,55 @@ def generate(inputs: Sequence[str | Path], out_dir: str | Path) -> Path:
     return zip_path
 
 
+def document_generate(*args: Any, **kwargs: Any) -> Path:
+    """
+    Backwards-compatible entry point for the existing Flask route.
+
+        from Backend.Analyzer.generate_doc import document_generate
+
+    The rewrite named its entry point generate(); this keeps the old name
+    working. It accepts the argument shapes the previous version was called
+    with and forwards them:
+
+        document_generate("export.xml")
+        document_generate("export.xml", "reports")
+        document_generate(["a.xml", "b.xml"], out_dir="reports")
+        document_generate(file_path="export.xml", output_dir="reports")
+
+    Returns the path to the .pdf, or to the .zip when more than one report was
+    produced. If the route expects a string, wrap the result in str().
+    """
+    inputs: Any = None
+    out_dir: Any = None
+
+    positional = list(args)
+    if positional:
+        inputs = positional.pop(0)
+    if positional:
+        out_dir = positional.pop(0)
+
+    for key in ("file_path", "file_paths", "files", "input_path", "inputs", "path", "xml_path"):
+        if inputs is None and key in kwargs:
+            inputs = kwargs[key]
+    for key in ("out_dir", "output_dir", "output_path", "outdir", "dest", "destination"):
+        if out_dir is None and key in kwargs:
+            out_dir = kwargs[key]
+
+    if inputs is None:
+        raise TypeError(
+            "document_generate() needs the export file to analyse. Pass it "
+            "positionally, or as file_path=..."
+        )
+
+    # A single path, or any iterable of them.
+    if isinstance(inputs, (str, Path)):
+        inputs = [inputs]
+    else:
+        inputs = list(inputs)
+
+    return generate(inputs, out_dir or DEFAULT_OUTPUT_DIR)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
@@ -2359,7 +2431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Generate a workflow analysis report from DataStage XML exports."
     )
     parser.add_argument("inputs", nargs="+", help="One or more DataStage XML export files.")
-    parser.add_argument("-o", "--out-dir", default="reports", help="Output directory.")
+    parser.add_argument("-o", "--out-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory.")
     parser.add_argument("-t", "--template", default=None, help="Path to temp.docx.")
     parser.add_argument("--no-llm", action="store_true",
                         help="Skip narrative generation; produce tables only.")
