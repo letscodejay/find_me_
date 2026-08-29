@@ -217,8 +217,26 @@ LLM_ENABLED = True                  # False -> tables only, no descriptive prose
 LLM_TEMPERATURE = 0.0               # documentation must be reproducible
 LLM_TIMEOUT_SECONDS = 180
 LLM_MAX_RETRIES = 1
-AZURE_DEPLOYMENT_ENV = "AZURE_OPENAI_DEPLOYMENT"
-AZURE_API_VERSION_ENV = "AZURE_OPENAI_API_VERSION"
+# The project keeps its Azure settings in Modules/Libraries.py, so they are read
+# from there first and fall back to environment variables. If that module
+# already builds an AzureChatOpenAI client, it is reused as-is rather than
+# constructing a second one.
+LLM_CONFIG_MODULES = (
+    "Modules.Libraries", "modules.Libraries", "Modules.libraries",
+    "modules.libraries", "Libraries",
+)
+LLM_INSTANCE_NAMES = ("llm", "LLM", "azure_llm", "chat_model", "client", "openai_client")
+LLM_CONFIG_NAMES = {
+    "deployment": ("AZURE_OPENAI_DEPLOYMENT", "AZURE_DEPLOYMENT", "DEPLOYMENT_NAME",
+                   "AZURE_OPENAI_DEPLOYMENT_NAME", "deployment_name", "MODEL_NAME",
+                   "AZURE_DEPLOYMENT_NAME"),
+    "endpoint": ("AZURE_OPENAI_ENDPOINT", "AZURE_ENDPOINT", "OPENAI_API_BASE",
+                 "AZURE_OPENAI_API_BASE", "azure_endpoint", "ENDPOINT"),
+    "api_key": ("AZURE_OPENAI_API_KEY", "AZURE_API_KEY", "OPENAI_API_KEY",
+                "AZURE_OPENAI_KEY", "api_key", "API_KEY"),
+    "api_version": ("AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION", "API_VERSION",
+                    "api_version"),
+}
 AZURE_API_VERSION_DEFAULT = "2024-08-01-preview"
 
 # --- Analysis limits ----------------------------------------------------------
@@ -1066,16 +1084,76 @@ def generate_narrative(graph: WorkflowGraph) -> Narrative:
     return narrative
 
 
+def _load_config_module():
+    """The project's own settings module, if it is importable from here."""
+    import importlib
+
+    for name in LLM_CONFIG_MODULES:
+        try:
+            return importlib.import_module(name)
+        except Exception:
+            continue
+    return None
+
+
+def _llm_setting(kind: str, module) -> str | None:
+    """A setting from the project's config module, else the environment."""
+    for attr in LLM_CONFIG_NAMES[kind]:
+        if module is not None:
+            value = getattr(module, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        value = os.environ.get(attr)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 def _build_llm():
-    deployment = os.environ.get(AZURE_DEPLOYMENT_ENV)
+    module = _load_config_module()
+
+    # If the project already builds a client, reuse it. Constructing a second
+    # one risks disagreeing with whatever patches the project applies to it.
+    if module is not None:
+        for attr in LLM_INSTANCE_NAMES:
+            candidate = getattr(module, attr, None)
+            if candidate is not None and isinstance(candidate, AzureChatOpenAI):
+                log.info("Reusing the AzureChatOpenAI client from %s.%s",
+                         module.__name__, attr)
+                return candidate
+
+    deployment = _llm_setting("deployment", module)
     if not deployment:
-        raise RuntimeError(f"{AZURE_DEPLOYMENT_ENV} is not set.")
-    return AzureChatOpenAI(
-        azure_deployment=deployment,
-        api_version=os.environ.get(AZURE_API_VERSION_ENV, AZURE_API_VERSION_DEFAULT),
-        temperature=LLM_TEMPERATURE,
-        timeout=LLM_TIMEOUT_SECONDS,
+        looked = ", ".join(LLM_CONFIG_NAMES["deployment"][:4])
+        raise RuntimeError(
+            "No Azure deployment name found. Looked for "
+            f"{looked} in {module.__name__ if module else 'the environment'}. "
+            "Add the correct attribute name to LLM_CONFIG_NAMES in generate_doc.py."
+        )
+
+    kwargs: dict[str, Any] = {
+        "azure_deployment": deployment,
+        "api_version": _llm_setting("api_version", module) or AZURE_API_VERSION_DEFAULT,
+        "temperature": LLM_TEMPERATURE,
+        "timeout": LLM_TIMEOUT_SECONDS,
+    }
+    # Only pass these when found; otherwise langchain reads them from the
+    # environment itself, which is the documented behaviour.
+    endpoint = _llm_setting("endpoint", module)
+    api_key = _llm_setting("api_key", module)
+    if endpoint:
+        kwargs["azure_endpoint"] = endpoint
+    if api_key:
+        kwargs["api_key"] = api_key
+
+    log.info(
+        "Azure client: deployment=%s endpoint=%s key=%s (from %s)",
+        deployment,
+        "set" if endpoint else "from environment",
+        "set" if api_key else "from environment",
+        module.__name__ if module else "environment",
     )
+    return AzureChatOpenAI(**kwargs)
 
 
 GROUNDING_RULES = """
