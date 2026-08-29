@@ -26,6 +26,7 @@ Layout of this file
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -229,6 +230,16 @@ MAX_STAGES_FOR_DIAGRAM = 25         # wider workflows omit Figure 1
 # Used when the caller does not pass one - the Flask route often does not.
 DEFAULT_OUTPUT_DIR = "reports"
 
+# Where uploaded or selected exports live. document_generate() is called with a
+# project name and a file selection rather than full paths, so it looks for each
+# file under these roots, in order, before giving up. Add your own if the first
+# run reports that a file could not be found.
+PROJECT_ROOTS = (
+    "INPUTS/analyzer_INPUTS", "INPUTS", "uploads", "data", "projects",
+    "Backend/uploads", ".",
+)
+PROJECT_FILE_SEARCH_DEPTH = 4          # how deep to search a root as a last resort
+
 # --- Conversion ---------------------------------------------------------------
 KEEP_INTERMEDIATE_DOCX = False      # True leaves the .docx next to the .pdf
 PDF_CONVERSION_TIMEOUT_SECONDS = 300
@@ -242,17 +253,26 @@ PDF_CONVERSION_TIMEOUT_SECONDS = 300
 
 # Record Type values, grouped by what they mean. Kept as data so a new DataStage
 # variant is a one-line change rather than a new branch.
-RECORD_TYPES_JOB = {"DSJob", "Job"}
+RECORD_TYPES_JOB = {"DSJob", "JobDefn", "Job"}
 RECORD_TYPES_STAGE = {
-    "CustomStage", "Stage", "ContainerStage", "CContainer",
+    "CustomStage", "TransformerStage", "Stage", "ContainerStage", "CContainer",
     "CTrxStage", "ServerStage", "ParallelStage",
 }
-RECORD_TYPES_INPUT = {"CustomInput", "CTrxInput", "StageInput", "Input"}
-RECORD_TYPES_OUTPUT = {"CustomOutput", "CTrxOutput", "StageOutput", "Output"}
+RECORD_TYPES_INPUT = {"CustomInput", "TrxInput", "CTrxInput", "StageInput", "Input"}
+RECORD_TYPES_OUTPUT = {"CustomOutput", "TrxOutput", "CTrxOutput", "StageOutput", "Output"}
 RECORD_TYPES_ANNOTATION = {"Annotation", "CAnnotation"}
 
-# Stage types that consume a reference (lookup-style) input.
-REFERENCE_CONSUMER_HINTS = ("lookup", "join", "merge")
+# Records that describe the export rather than the workflow. StageType records
+# are stage *definitions*, not stages on the canvas, and ContainerView is the
+# designer's view of the job. Listing either in Section 2 would be noise.
+RECORD_TYPES_IGNORED = {"StageType", "ContainerView", "JobView", "TableDef"}
+
+# Stage types whose secondary inputs are reference data rather than a second
+# stream of records. Only lookup-style stages qualify: a Join takes two equal
+# data inputs and a Merge takes a master plus updates, so neither secondary
+# input is reference data, and classifying them as such would move a real source
+# out of Section 4 and into Section 6.
+REFERENCE_CONSUMER_HINTS = ("lookup",)
 
 # Property names that may hold a record's display name, in order of preference.
 NAME_PROPERTY_CANDIDATES = ("Name", "StageName", "LinkName", "Identifier")
@@ -263,6 +283,22 @@ PARTNER_PROPERTY_CANDIDATES = ("Partner", "PartnerLink", "LinkPartner")
 
 # Identifier convention: V0S3P2 -> stage V0S3, port index 2.
 _PORT_ID_RE = re.compile(r"^(?P<stage>.*?S\d+)P(?P<port>\d+)$", re.IGNORECASE)
+
+# A Partner value can name the far end in two ways, both seen in real exports:
+#   "V0S2P1"           just the port
+#   "V0S2|V0S2P1"      the stage and the port, pipe separated
+# The second form states the owning stage outright, so it is preferred over
+# deriving the owner from the port identifier.
+def _parse_partner(value: str | None) -> tuple[str | None, str | None]:
+    """Return (stage identifier or None, port identifier or None)."""
+    if not value:
+        return None, None
+    parts = [p.strip() for p in value.replace("\\", "|").split("|") if p.strip()]
+    if not parts:
+        return None, None
+    if len(parts) >= 2:
+        return parts[0], parts[-1]
+    return None, parts[0]
 
 
 class ParseError(Exception):
@@ -514,6 +550,8 @@ class DataStageParser:
     def _build_stages(self, records: dict[str, dict[str, Any]]) -> list[Stage]:
         stages: list[Stage] = []
         for rec in records.values():
+            if rec["type"] in RECORD_TYPES_IGNORED:
+                continue
             if rec["type"] not in RECORD_TYPES_STAGE:
                 continue
             stages.append(
@@ -561,34 +599,49 @@ class DataStageParser:
                 continue
 
             out_id = rec["identifier"]
-            partner = self._first_prop(rec, *PARTNER_PROPERTY_CANDIDATES)
+            raw_partner = self._first_prop(rec, *PARTNER_PROPERTY_CANDIDATES)
+            partner_stage, partner_port = _parse_partner(raw_partner)
 
-            if not partner:
+            if not partner_port and not partner_stage:
                 warnings.append(
                     f"Output port {out_id} declares no partner link; the edge is omitted."
                 )
                 continue
-            if partner not in records:
-                warnings.append(
-                    f"Output port {out_id} declares a partner link ({partner}) that is not "
-                    "present in the export, indicating a boundary with a shared container."
-                )
-                continue
 
-            from_stage = self._owner_of(out_id)
-            to_stage = self._owner_of(partner)
+            # The far stage: a pipe-separated Partner names it outright.
+            to_stage = partner_stage or (self._owner_of(partner_port) if partner_port else None)
+
+            # The near stage: the port on the other end usually points back with
+            # the same stage|port form, which states this stage outright. That is
+            # more reliable than inferring ownership from the identifier, so it is
+            # tried first and the identifier is only a fallback.
+            from_stage = None
+            back = records.get(partner_port or "", {})
+            if back:
+                back_stage, _ = _parse_partner(
+                    self._first_prop(back, *PARTNER_PROPERTY_CANDIDATES)
+                )
+                if back_stage:
+                    from_stage = back_stage
+            if not from_stage:
+                from_stage = self._owner_of(out_id)
+
             if not from_stage or not to_stage:
                 warnings.append(
-                    f"Could not determine the stages either side of the link {out_id} -> {partner}."
+                    f"Could not determine the stages either side of the link "
+                    f"{out_id} -> {raw_partner}."
                 )
                 continue
             if from_stage not in stage_ids or to_stage not in stage_ids:
+                missing = from_stage if from_stage not in stage_ids else to_stage
                 warnings.append(
-                    f"Link {out_id} -> {partner} references a stage that is not documented."
+                    f"Link {out_id} -> {raw_partner} references {missing}, which is not "
+                    "documented as a stage in this export. This usually indicates a "
+                    "boundary with a shared container."
                 )
                 continue
 
-            in_rec = records[partner]
+            in_rec = records.get(partner_port or "", {})
             name = (
                 self._first_prop(rec, *NAME_PROPERTY_CANDIDATES)
                 or self._first_prop(in_rec, *NAME_PROPERTY_CANDIDATES)
@@ -600,8 +653,8 @@ class DataStageParser:
                     from_stage=from_stage,
                     to_stage=to_stage,
                     from_port=out_id,
-                    to_port=partner,
-                    to_port_index=self._port_index(partner),
+                    to_port=partner_port or "",
+                    to_port_index=self._port_index(partner_port) if partner_port else None,
                     properties=dict(rec["properties"]),
                 )
             )
@@ -2375,53 +2428,146 @@ def generate(inputs: Sequence[str | Path], out_dir: str | Path) -> Path:
     return zip_path
 
 
-def document_generate(*args: Any, **kwargs: Any) -> Path:
+class ReportStream(io.BytesIO):
     """
-    Backwards-compatible entry point for the existing Flask route.
+    The result of document_generate().
 
-        from Backend.Analyzer.generate_doc import document_generate
-
-    The rewrite named its entry point generate(); this keeps the old name
-    working. It accepts the argument shapes the previous version was called
-    with and forwards them:
-
-        document_generate("export.xml")
-        document_generate("export.xml", "reports")
-        document_generate(["a.xml", "b.xml"], out_dir="reports")
-        document_generate(file_path="export.xml", output_dir="reports")
-
-    Returns the path to the .pdf, or to the .zip when more than one report was
-    produced. If the route expects a string, wrap the result in str().
+    The route names the return value `stream`, but it is not certain whether the
+    previous version handed back bytes or a path, so this is both: it reads like
+    a file object, it satisfies os.PathLike, and str() gives the path on disk.
+    Flask's send_file accepts it either way.
     """
-    inputs: Any = None
-    out_dir: Any = None
 
-    positional = list(args)
-    if positional:
-        inputs = positional.pop(0)
-    if positional:
-        out_dir = positional.pop(0)
-
-    for key in ("file_path", "file_paths", "files", "input_path", "inputs", "path", "xml_path"):
-        if inputs is None and key in kwargs:
-            inputs = kwargs[key]
-    for key in ("out_dir", "output_dir", "output_path", "outdir", "dest", "destination"):
-        if out_dir is None and key in kwargs:
-            out_dir = kwargs[key]
-
-    if inputs is None:
-        raise TypeError(
-            "document_generate() needs the export file to analyse. Pass it "
-            "positionally, or as file_path=..."
+    def __init__(self, path: Path):
+        super().__init__(path.read_bytes())
+        self.path = path
+        self.name = path.name
+        self.mimetype = (
+            "application/zip" if path.suffix == ".zip" else "application/pdf"
         )
 
-    # A single path, or any iterable of them.
-    if isinstance(inputs, (str, Path)):
-        inputs = [inputs]
-    else:
-        inputs = list(inputs)
+    def __fspath__(self) -> str:
+        return str(self.path)
 
-    return generate(inputs, out_dir or DEFAULT_OUTPUT_DIR)
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def __repr__(self) -> str:
+        return f"<ReportStream {self.path.name} {len(self.getbuffer()):,} bytes>"
+
+
+def _resolve_export_path(file_name: str | Path, project: str | None) -> Path:
+    """
+    Turn a selected file name into a path on disk.
+
+    The route passes a project name and a file name rather than a path, and the
+    convention that joins them is not recorded anywhere, so each plausible
+    arrangement is tried in turn and the one that exists wins. The failure
+    message lists everything that was tried, which is usually enough to identify
+    the real convention on the first run.
+    """
+    candidate = Path(file_name)
+    if candidate.is_file():
+        return candidate
+
+    tried: list[str] = [str(candidate)]
+    roots = [Path(r) for r in PROJECT_ROOTS]
+
+    layouts: list[Path] = []
+    for root in roots:
+        if project:
+            layouts.append(root / project / candidate)
+        layouts.append(root / candidate)
+    if project:
+        layouts.append(Path(project) / candidate)
+
+    for layout in layouts:
+        tried.append(str(layout))
+        if layout.is_file():
+            log.info("Resolved %s to %s", file_name, layout)
+            return layout
+
+    # Last resort: look for the filename anywhere under the roots.
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for depth in range(1, PROJECT_FILE_SEARCH_DEPTH + 1):
+            pattern = "/".join(["*"] * depth) + "/" + candidate.name
+            for hit in root.glob(pattern):
+                if hit.is_file():
+                    log.info("Found %s by searching %s: %s", candidate.name, root, hit)
+                    return hit
+
+    raise FileNotFoundError(
+        f"Could not find the export '{file_name}'"
+        + (f" for project '{project}'" if project else "")
+        + ".\nLooked in:\n  "
+        + "\n  ".join(tried)
+        + "\nAdd the correct directory to PROJECT_ROOTS in generate_doc.py."
+    )
+
+
+def document_generate(*args: Any, **kwargs: Any) -> ReportStream:
+    """
+    Entry point for the Flask route, kept at its original name.
+
+        stream = document_generate(project_name_selection, file_name_selection)
+
+    The file selection may be one name or several; several produce a ZIP. Names
+    are resolved against PROJECT_ROOTS - see _resolve_export_path.
+
+    Also accepts the other shapes this function has been called with:
+
+        document_generate("export.xml")
+        document_generate(["a.xml", "b.xml"], out_dir="reports")
+        document_generate(project="P1", file_name_selection=["a.xml"])
+    """
+    project: Any = None
+    selection: Any = None
+    out_dir: Any = kwargs.get("out_dir") or kwargs.get("output_dir") or kwargs.get("dest")
+
+    positional = list(args)
+    if len(positional) >= 2:
+        project, selection = positional[0], positional[1]
+        if len(positional) >= 3 and out_dir is None:
+            out_dir = positional[2]
+        # A second string argument is ambiguous: it may be the file selection or
+        # an output directory. An existing directory is treated as the latter.
+        if isinstance(selection, (str, Path)) and Path(selection).is_dir():
+            log.info("Second argument %r is a directory; using it as the output "
+                     "directory.", str(selection))
+            out_dir, selection = selection, project
+            project = None
+    elif positional:
+        selection = positional[0]
+
+    for key in ("project_name_selection", "project_name", "project", "project_id"):
+        if project is None and key in kwargs:
+            project = kwargs[key]
+    for key in ("file_name_selection", "file_name", "file_names", "file_path",
+                "file_paths", "files", "inputs", "xml_path", "path"):
+        if selection is None and key in kwargs:
+            selection = kwargs[key]
+
+    if selection is None:
+        raise TypeError(
+            "document_generate() needs the export file(s) to analyse. Pass them "
+            "positionally after the project name, or as file_name_selection=..."
+        )
+
+    if isinstance(selection, (str, Path)):
+        selection = [selection]
+    else:
+        selection = list(selection)
+    if not selection:
+        raise ValueError("document_generate() was given an empty file selection.")
+
+    project = str(project) if project else None
+    inputs = [_resolve_export_path(name, project) for name in selection]
+    log.info("Generating from %s export(s)%s.", len(inputs),
+             f" in project {project}" if project else "")
+
+    return ReportStream(generate(inputs, out_dir or DEFAULT_OUTPUT_DIR))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
