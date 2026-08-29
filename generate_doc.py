@@ -1,27 +1,22 @@
 """
 generate_doc.py
 ===============
-DataStage workflow XML  ->  Word document (.docx)  ->  PDF report.
+DataStage workflow XML  ->  analysis  ->  PDF report.
 
-Pipeline
---------
-    .xml  ->  DataStageParser  ->  WorkflowGraph  ->  Narrative (CrewAI)  ->  DocxBuilder  ->  PdfConverter
+    .xml  ->  DataStageParser  ->  WorkflowGraph  ->  Narrative  ->  PDF
 
-Batch behaviour
----------------
-    one input file  producing one report   ->  a single .pdf
-    anything more   (several files, or one file holding several jobs)
-                                            ->  a .zip containing every .pdf
+Rendering is done directly with ReportLab, which is a pure Python wheel: no
+system libraries, no browser, nothing to install beyond pip. Page geometry and
+column widths are given in points, so the layout is identical everywhere.
 
-Layout of this file
--------------------
-    SECTION A   Visual formatting tunables      <- edit these to restyle the report
-    SECTION B   DataStage parser
-    SECTION C   Graph analysis
-    SECTION D   Narrative generation (LLM)
-    SECTION E   Word document builder
-    SECTION F   PDF conversion
-    SECTION G   Orchestration and CLI
+One input file producing one report gives a .pdf; anything more gives a .zip.
+
+    SECTION A   Tunables
+    SECTION B   Parser
+    SECTION C   Analysis
+    SECTION D   Narrative
+    SECTION E   Rendering
+    SECTION F   Orchestration and CLI
 """
 
 from __future__ import annotations
@@ -32,173 +27,121 @@ import logging
 import os
 import re
 import shutil
-import tempfile
-import threading
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from crewai import Agent, Crew, Process, Task
-from docx import Document
 from langchain_openai import AzureChatOpenAI
-from docx2pdf import convert as docx_to_pdf
-import pythoncom
-import win32com.client
-
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor, Inches
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_JUSTIFY
+from reportlab.lib.pagesizes import A4, LETTER
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfgen.canvas import Canvas
+from reportlab.platypus import (
+    BaseDocTemplate, Frame, KeepTogether, PageBreak, PageTemplate, Paragraph,
+    Preformatted, Spacer, Table, TableStyle,
+)
 
 log = logging.getLogger("generate_doc")
+HERE = Path(__file__).resolve().parent
 
 
 # =============================================================================
-# SECTION A   VISUAL FORMATTING TUNABLES
+# SECTION A   TUNABLES
 # =============================================================================
-# Everything controlling how the report looks. The builder overrides the
-# template's own styles with these.
 
-# --- Template -----------------------------------------------------------------
-# Path to temp.docx. Page 1 is the cover and is left untouched; the report is
-# appended from page 2 onward.
-TEMPLATE_DOCX_PATH = r"temp.docx"
+# --- Files --------------------------------------------------------------------
+DEFAULT_OUTPUT_DIR = "reports"
 
-# "auto" detects whether temp.docx already ends on a page break. Getting this
-# wrong is silent: a blank page 2, or the contents landing on the cover.
-INSERT_PAGE_BREAK_AFTER_TEMPLATE = "auto"
-
-# Delete any empty trailing paragraphs the template leaves behind before writing.
-TRIM_TEMPLATE_TRAILING_EMPTY_PARAGRAPHS = True
-
-# If the template ends on several page breaks in a row, keep only one, so the
-# contents starts on the page immediately after the cover rather than leaving a
-# blank page between them.
-COLLAPSE_EXTRA_TEMPLATE_PAGE_BREAKS = True
+# Where selected exports live. document_generate() gets a project and a file
+# name, not a path, so each of these is tried in turn.
+PROJECT_ROOTS = (
+    "INPUTS/analyzer_INPUTS", "INPUTS", "uploads", "data", "projects",
+    "Backend/uploads", ".",
+)
+PROJECT_FILE_SEARCH_DEPTH = 4
 
 # --- Page ---------------------------------------------------------------------
-# Table widths are measured from the real page at build time, so A4 and Letter
-# both fit without changes here.
-# Off by default: page geometry belongs to temp.docx, and forcing margins would
-# shift its cover page too.
-FORCE_PAGE_SIZE = False
-PAGE_WIDTH_IN = 8.27          # only used when FORCE_PAGE_SIZE is True
-PAGE_HEIGHT_IN = 11.69
-FORCE_PAGE_MARGINS = False    # True applies the four margins below to every page
+PAGE_SIZE = "A4"                     # "A4" or "LETTER"
+MARGIN_TOP_MM = 20.0
+MARGIN_BOTTOM_MM = 18.0
+MARGIN_SIDE_MM = 20.0
 
-PAGE_MARGIN_TOP_IN = 0.85
-PAGE_MARGIN_BOTTOM_IN = 0.75
-PAGE_MARGIN_LEFT_IN = 0.90
-PAGE_MARGIN_RIGHT_IN = 0.90
-# Fallback only. The builder measures the real width from the document.
-CONTENT_WIDTH_IN = PAGE_WIDTH_IN - PAGE_MARGIN_LEFT_IN - PAGE_MARGIN_RIGHT_IN
+# --- Palette ------------------------------------------------------------------
+COLOR_CORAL = "#C4503C"
+COLOR_CORAL_DEEP = "#A63D2B"
+COLOR_CORAL_LINE = "#E8C3BA"
+COLOR_INK = "#17242E"
+COLOR_INK_DIM = "#5D6E78"
+COLOR_INK_FAINT = "#8A979E"
+COLOR_RULE = "#DCDFDC"
+COLOR_RULE_SOFT = "#EBEDEA"
+COLOR_HEAD_BG = "#F1F0EC"
+COLOR_KEY_BG = "#F7F6F2"
+COLOR_BAND_BG = "#F4F3EF"
+COLOR_PANEL_BG = "#EEF4F4"
+COLOR_PANEL_LINE = "#B6D2D4"
+COLOR_ROLE_SOURCE = "#2F6F4E"
+COLOR_ROLE_REFERENCE = "#5B4B8A"
+COLOR_ROLE_TRANSFORM = "#8A5A00"
+COLOR_ROLE_TARGET = "#8C3A3A"
 
-# --- Palette (hex, no leading #) ----------------------------------------------
-COLOR_CORAL = "C4503C"        # section headings
-COLOR_CORAL_DEEP = "A63D2B"   # section number eyebrow, table captions
-COLOR_CORAL_LINE = "E8C3BA"   # hairline under a section heading
-COLOR_INK = "17242E"          # body text
-COLOR_INK_DIM = "5D6E78"      # table header text
-COLOR_INK_FAINT = "8A979E"    # running header / footer, "not identified" text
-COLOR_RULE = "DCDFDC"         # table borders
-COLOR_TABLE_HEAD_BG = "F1F0EC"
-COLOR_KEY_CELL_BG = "F7F6F2"  # left column of key/value tables
-COLOR_DIAGRAM_BG = "F7F6F2"
+# The PDF base-14 fonts. They are part of the PDF specification, so nothing is
+# installed, nothing is embedded, and the metrics are identical on every reader.
+FONT_SANS = "Helvetica"
+FONT_SANS_BOLD = "Helvetica-Bold"
+FONT_SERIF = "Times-Roman"
+FONT_SERIF_ITALIC = "Times-Italic"
+FONT_MONO = "Courier"
+FONT_MONO_BOLD = "Courier-Bold"
 
-# --- Typefaces ----------------------------------------------------------------
-# Use fonts installed on the machine that runs the conversion, otherwise Word
-# substitutes silently and the PDF will not match the draft.
-FONT_SANS = "Arial"            # headings
-FONT_SERIF = "Georgia"         # descriptive prose
-FONT_MONO = "Consolas"         # identifiers, technical names, diagram
-
-# --- Type scale (points) ------------------------------------------------------
-SIZE_SECTION_NUMBER = 7.5      # "SECTION 4" eyebrow
+# --- Type scale (pt) ----------------------------------------------------------
+SIZE_SECTION_NUMBER = 7.0
 SIZE_SECTION_TITLE = 13.0
-SIZE_BODY = 9.5                # descriptive prose
+SIZE_BODY = 9.5
 SIZE_TABLE = 8.5
 SIZE_TABLE_HEAD = 7.5
 SIZE_CAPTION = 7.0
-SIZE_DIAGRAM = 8.0
-SIZE_RUNNING = 7.5             # header / footer
-SIZE_TOC = 9.5
+SIZE_DIAGRAM = 7.5
+SIZE_RUNNING = 7.5
 
-# --- Spacing (points) ---------------------------------------------------------
-SECTION_STARTS_NEW_PAGE = True      # every section begins on a fresh page
-SKIP_EMPTY_SECTIONS = True          # a section with no rows is left out entirely
-SPACE_BEFORE_SECTION = 16.0
-SPACE_AFTER_SECTION_TITLE = 7.0
-SPACE_AFTER_TABLE = 4.0
-SPACE_AFTER_CAPTION = 12.0
-SPACE_AFTER_PARAGRAPH = 5.0
-LINE_SPACING_BODY = 1.28
-LINE_SPACING_TABLE = 1.12
-
-# --- Rules and borders --------------------------------------------------------
-SECTION_RULE_WIDTH_EIGHTHS = 6      # hairline under section heading (1/8 pt units)
-TABLE_BORDER_WIDTH_EIGHTHS = 4
-TABLE_HEAD_BORDER_WIDTH_EIGHTHS = 6
-
-# --- Table behaviour ----------------------------------------------------------
-# Fixed layout is what stops a long technical name widening its column and
-# pushing the table past the page margin. Leave this on.
-TABLE_FIXED_LAYOUT = True
-TABLE_REPEAT_HEADER_ROW = True      # long tables repeat their header across pages
-TABLE_ROWS_KEEP_TOGETHER = False    # True stops rows splitting mid-cell
-TABLE_CELL_PAD_TWIPS = 60           # ~3pt
-
-# --- Prose --------------------------------------------------------------------
-JUSTIFY_DESCRIPTIONS = True         # descriptive prose is justified
-UPPERCASE_SECTION_NUMBER = True
-SECTION_NUMBER_SPACING_TWIPS = 30   # letter-spacing on the eyebrow
-
-# --- Running header / footer --------------------------------------------------
-# "template" keeps whatever temp.docx defines; "generate" builds its own.
-HEADER_FOOTER_MODE = "template"
-
-# Adds a page number only when the template footer has none.
-ADD_PAGE_NUMBER_IF_TEMPLATE_HAS_NONE = True
-
-# Used only when HEADER_FOOTER_MODE == "generate".
-SHOW_RUNNING_HEADER = True
-SHOW_RUNNING_FOOTER = True
-RUNNING_HEADER_LEFT = "Workflow Analysis Report"   # right side shows the job name
-FOOTER_PAGE_FORMAT = "Page {page} of {total}"      # rendered as live Word fields
-
-# --- Content limits -----------------------------------------------------------
-# The model writes variable-length text and names can be any length. These caps
-# keep the layout the same whatever arrives.
-MAX_DESCRIPTION_CHARS = 340         # per table cell; trimmed at a sentence end
-MAX_PATH_CELL_CHARS = 260           # a very long path chain in Section 8
-MAX_PROSE_PARAGRAPHS = 3            # Section 3 and the Section 8 summary
-MAX_PROSE_CHARS = 1500
-LONG_TOKEN_BREAK_AFTER = 28         # only split a run with no separator once it is this long
-TRUNCATION_MARK = "…"
-
-# A wider diagram shrinks until it fits, then falls back.
-MAX_DIAGRAM_LINES = 90
-DIAGRAM_MIN_FONT = 6.0
-MONO_CHAR_WIDTH_RATIO = 0.55        # Consolas advance width as a fraction of the em
-
-# --- Missing-value wording ----------------------------------------------------
+# --- Report wording -----------------------------------------------------------
+REPORT_TITLE = "Workflow Analysis Report"
+REPORT_SUBTITLE = "IBM InfoSphere DataStage"
 TEXT_NOT_IDENTIFIED = "Not identified from file"
 TEXT_NOT_APPLICABLE = "Not applicable"
 
-# --- Report wording -----------------------------------------------------------
-CONTENTS_HEADING = "Contents"
-CONTENTS_EYEBROW = "Table of"
+SECTION_STARTS_NEW_PAGE = True
+SKIP_EMPTY_SECTIONS = True
+MARK_GENERATED_PROSE = True          # a rule beside model-written text
+
+# --- Content limits -----------------------------------------------------------
+MAX_DESCRIPTION_CHARS = 340
+MAX_PATH_CELL_CHARS = 260
+MAX_PROSE_PARAGRAPHS = 3
+MAX_PROSE_CHARS = 1500
+TRUNCATION_MARK = "…"
+
+# --- Diagram ------------------------------------------------------------------
+MAX_STAGES_FOR_DIAGRAM = 40
+MAX_DIAGRAM_LINE_CHARS = 78          # fits the content width at SIZE_DIAGRAM
+# Courier has no box-drawing glyphs, so the chart is drawn in ASCII. "box" needs
+# a TrueType font registered with ReportLab first.
+DIAGRAM_STYLE = "ascii"
+GLANCE_DIAGRAM_STAGES = 6            # Section 1 shows the main chain only
+
+# --- Analysis limits ----------------------------------------------------------
+MAX_PATHS = 200
+MAX_PATH_DEPTH = 50
 
 # --- LLM ----------------------------------------------------------------------
-LLM_ENABLED = True                  # False -> tables only, no descriptive prose
-LLM_TEMPERATURE = 0.0               # documentation must be reproducible
+LLM_ENABLED = True
+LLM_TEMPERATURE = 0.0
 LLM_TIMEOUT_SECONDS = 180
 LLM_MAX_RETRIES = 1
-# The project keeps its Azure settings in Modules/Libraries.py, so they are read
-# from there first and fall back to environment variables. If that module
-# already builds an AzureChatOpenAI client, it is reused as-is rather than
-# constructing a second one.
 LLM_CONFIG_MODULES = (
     "Modules.Libraries", "modules.Libraries", "Modules.libraries",
     "modules.libraries", "Libraries",
@@ -217,78 +160,48 @@ LLM_CONFIG_NAMES = {
 }
 AZURE_API_VERSION_DEFAULT = "2024-08-01-preview"
 
-# --- Analysis limits ----------------------------------------------------------
-MAX_PATHS = 200                     # stop enumerating beyond this
-MAX_PATH_DEPTH = 50
-MAX_STAGES_FOR_DIAGRAM = 25         # wider workflows omit Figure 1
-
-# --- Output -------------------------------------------------------------------
-# Used when the caller does not pass one - the Flask route often does not.
-DEFAULT_OUTPUT_DIR = "reports"
-
-# Where uploaded or selected exports live. document_generate() is called with a
-# project name and a file selection rather than full paths, so it looks for each
-# file under these roots, in order, before giving up. Add your own if the first
-# run reports that a file could not be found.
-PROJECT_ROOTS = (
-    "INPUTS/analyzer_INPUTS", "INPUTS", "uploads", "data", "projects",
-    "Backend/uploads", ".",
-)
-PROJECT_FILE_SEARCH_DEPTH = 4          # how deep to search a root as a last resort
-
-# --- Conversion ---------------------------------------------------------------
-KEEP_INTERMEDIATE_DOCX = False      # True leaves the .docx next to the .pdf
-
 
 # =============================================================================
-# SECTION B   DATASTAGE PARSER
+# SECTION B   PARSER
 # =============================================================================
 # XML to a typed model. No formatting, no graph reasoning.
+#
+# Record types are recognised structurally, not from a fixed list. A list is
+# what let 46 HashedFileStage records be dropped in silence; anything carrying a
+# StageType is treated as a stage even when its type name is new.
 
-# Record Type values by meaning. Data, not branches, so a new DataStage variant
-# is a one-line change.
-RECORD_TYPES_JOB = {"DSJob", "JobDefn", "Job"}
-RECORD_TYPES_STAGE = {
-    "CustomStage", "TransformerStage", "HashedFileStage", "Stage",
-    "ContainerStage", "CContainer", "CTrxStage", "ServerStage", "ParallelStage",
+RECORD_TYPES_JOB = {"DSJob", "JobDefn", "Job", "JobDefinition"}
+RECORD_TYPES_ANNOTATION = {"Annotation", "CAnnotation", "Note"}
+# Definitions and designer furniture, never workflow objects.
+RECORD_TYPES_IGNORED = {
+    "StageType", "ContainerView", "JobView", "TableDef", "TableDefinition",
+    "Routine", "SharedContainerDef", "ParameterSet", "DataElement",
 }
-# Input ports are reached through their partner, not walked directly. Listed so
-# diagnose.py can tell handled record types from unhandled ones.
+# Known names, kept so an export that omits StageType still resolves.
+RECORD_TYPES_STAGE = {
+    "CustomStage", "TransformerStage", "HashedFileStage", "SequentialFileStage",
+    "ODBCStage", "OracleStage", "Stage", "ContainerStage", "CContainer",
+    "CTrxStage", "ServerStage", "ParallelStage", "AggregatorStage", "SortStage",
+}
 RECORD_TYPES_INPUT = {
     "CustomInput", "TrxInput", "HashedInput", "CTrxInput", "StageInput", "Input",
+    "ODBCInput", "OracleInput", "SeqInput",
 }
 RECORD_TYPES_OUTPUT = {
-    "CustomOutput", "TrxOutput", "HashedOutput", "CTrxOutput", "StageOutput", "Output",
+    "CustomOutput", "TrxOutput", "HashedOutput", "CTrxOutput", "StageOutput",
+    "Output", "ODBCOutput", "OracleOutput", "SeqOutput",
 }
-RECORD_TYPES_ANNOTATION = {"Annotation", "CAnnotation"}
 
-# Definitions and designer views, not workflow objects.
-RECORD_TYPES_IGNORED = {"StageType", "ContainerView", "JobView", "TableDef"}
-
-# Stage types whose secondary inputs are reference data rather than a second
-# stream of records. Only lookup-style stages qualify: a Join takes two equal
-# data inputs and a Merge takes a master plus updates, so neither secondary
-# input is reference data, and classifying them as such would move a real source
-# out of Section 4 and into Section 6.
 REFERENCE_CONSUMER_HINTS = ("lookup",)
-
-# Property names that may hold a record's display name, in order of preference.
 NAME_PROPERTY_CANDIDATES = ("Name", "StageName", "LinkName", "Identifier")
-# Property names that may hold a stage's type.
-TYPE_PROPERTY_CANDIDATES = ("StageType", "Type", "OLEType", "StageTypeName")
-# Property names that may point at the port on the other end of a link.
+TYPE_PROPERTY_CANDIDATES = ("StageType", "OLEType", "StageTypeName", "Type")
 PARTNER_PROPERTY_CANDIDATES = ("Partner", "PartnerLink", "LinkPartner")
 
-# Identifier convention: V0S3P2 -> stage V0S3, port index 2.
 _PORT_ID_RE = re.compile(r"^(?P<stage>.*?S\d+)P(?P<port>\d+)$", re.IGNORECASE)
 
-# A Partner value can name the far end in two ways, both seen in real exports:
-#   "V0S2P1"           just the port
-#   "V0S2|V0S2P1"      the stage and the port, pipe separated
-# The second form states the owning stage outright, so it is preferred over
-# deriving the owner from the port identifier.
+
 def _parse_partner(value: str | None) -> tuple[str | None, str | None]:
-    """Return (stage identifier or None, port identifier or None)."""
+    """Partner may be 'V0S2P1' or 'V0S2|V0S2P1'. Returns (stage, port)."""
     if not value:
         return None, None
     parts = [p.strip() for p in value.replace("\\", "|").split("|") if p.strip()]
@@ -310,14 +223,15 @@ class NoJobsFound(ParseError):
 @dataclass
 class Stage:
     identifier: str
-    name: str | None                      # None -> not carried in the export
+    name: str | None
     stage_type: str | None
     properties: dict[str, str] = field(default_factory=dict)
     collections: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    record_type: str = ""
+    recognised: bool = True          # False when the type was inferred, not known
     annotation: str | None = None
-    # filled during graph analysis
-    role: str = "unclassified"            # source | reference | transformation | target
-    inputs: list[str] = field(default_factory=list)     # link names
+    role: str = "unclassified"
+    inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
 
     @property
@@ -326,10 +240,9 @@ class Stage:
 
     @property
     def display_type(self) -> str:
-        return self.stage_type or TEXT_NOT_IDENTIFIED
+        return self.stage_type or self.record_type or TEXT_NOT_IDENTIFIED
 
     def prop(self, *names: str, default: str | None = None) -> str | None:
-        """First non-empty value among the given property names."""
         for n in names:
             v = self.properties.get(n)
             if v:
@@ -340,81 +253,74 @@ class Stage:
 @dataclass
 class Link:
     name: str | None
-    from_stage: str                       # stage identifier
+    from_stage: str
     to_stage: str
-    from_port: str                        # port record identifier
+    from_port: str
     to_port: str
-    to_port_index: int | None = None      # 1 is normally the primary input
+    to_port_index: int | None = None
     is_reference: bool = False
+    is_reject: bool = False
+    column_count: int | None = None
     properties: dict[str, str] = field(default_factory=dict)
 
     @property
     def display_name(self) -> str:
         return self.name or TEXT_NOT_IDENTIFIED
 
+    @property
+    def kind(self) -> str:
+        if self.is_reference:
+            return "Reference"
+        return "Reject" if self.is_reject else "Stream"
+
 
 @dataclass
 class ParsedJob:
     job_name: str
     source_file: str
-    root_record: dict[str, Any]           # the DSJob record
-    job_record: dict[str, Any]            # the <Job> element's own attributes
+    root_record: dict[str, Any]
+    job_record: dict[str, Any]
     all_records: dict[str, dict[str, Any]]
     stages: list[Stage]
     links: list[Link]
     annotations: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    inferred_types: set[str] = field(default_factory=set)
 
 
 class DataStageParser:
-    """
-    Turns a DataStage XML export into ParsedJob objects - one per job in the file.
-
-    Written to be forgiving about the things that vary between DataStage
-    versions (element nesting, property casing, record type names) and strict
-    about the things that must not be guessed (which job, whether a link
-    actually resolved).
-    """
+    """Reads a DataStage XML export into one ParsedJob per job in the file."""
 
     def __init__(self, file_path: str | Path):
         self.path = Path(file_path)
         if not self.path.is_file():
             raise ParseError(f"File not found: {self.path}")
 
-    # -- entry point ----------------------------------------------------------
-
     def parse_all_jobs(self) -> list[ParsedJob]:
         root = self._load_xml()
-        job_elements = self._find_job_elements(root)
-        if not job_elements:
+        jobs = self._find_job_elements(root)
+        if not jobs:
             raise NoJobsFound(
                 f"No <Job> elements found in {self.path.name}. "
-                "The file may not be a DataStage XML export."
-            )
-        return [self._parse_job(el) for el in job_elements]
+                "The file may not be a DataStage XML export.")
+        return [self._parse_job(el) for el in jobs]
 
-    # -- XML loading ----------------------------------------------------------
+    # -- XML ------------------------------------------------------------------
 
     def _load_xml(self):
-        # lxml where available (faster, better recovery), else stdlib.
         try:
             from lxml import etree
-            parser = etree.XMLParser(recover=True, huge_tree=True)
-            tree = etree.parse(str(self.path), parser)
-            return tree.getroot()
-        except ImportError:
-            import xml.etree.ElementTree as ET
-            return ET.parse(str(self.path)).getroot()
-        except Exception as exc:                       # malformed beyond recovery
+            return etree.parse(
+                str(self.path), etree.XMLParser(recover=True, huge_tree=True)).getroot()
+        except ParseError:
+            raise
+        except Exception as exc:
             raise ParseError(f"Could not parse {self.path.name}: {exc}") from exc
 
     @staticmethod
     def _tag(el) -> str:
-        """Local tag name, namespace stripped."""
         t = el.tag
-        if not isinstance(t, str):
-            return ""
-        return t.rsplit("}", 1)[-1]
+        return t.rsplit("}", 1)[-1] if isinstance(t, str) else ""
 
     def _iter_children(self, el, *names: str):
         wanted = {n.lower() for n in names}
@@ -423,94 +329,68 @@ class DataStageParser:
                 yield child
 
     def _find_job_elements(self, root) -> list:
-        """Locate <Job> elements wherever the export puts them."""
-        found = []
-        for el in root.iter():
-            if self._tag(el) == "Job":
-                found.append(el)
+        found = [el for el in root.iter() if self._tag(el) == "Job"]
         if found:
             return found
-        # Some exports wrap everything in a single implicit job.
-        if self._tag(root) in ("DSExport", "DataStageExport"):
-            has_records = any(self._tag(e) == "Record" for e in root.iter())
-            if has_records:
-                return [root]
+        if any(self._tag(e) == "Record" for e in root.iter()):
+            return [root]        # some exports hold a single implicit job
         return []
-
-    # -- text extraction ------------------------------------------------------
 
     @staticmethod
     def _text_of(el) -> str:
-        """
-        Full text of an element including CDATA and nested runs.
-        DataStage wraps long property values in CDATA and sometimes splits them.
-        """
         try:
-            parts = list(el.itertext())
+            return "".join(p for p in el.itertext() if p).strip()
         except Exception:
-            parts = [el.text or ""]
-        return "".join(p for p in parts if p).strip()
+            return (el.text or "").strip()
 
-    def _read_properties(self, record_el) -> dict[str, str]:
+    def _read_properties(self, rec) -> dict[str, str]:
         props: dict[str, str] = {}
-        for prop in self._iter_children(record_el, "Property"):
+        for prop in self._iter_children(rec, "Property"):
             name = prop.get("Name") or prop.get("name")
             if not name:
                 continue
             value = self._text_of(prop)
-            # Keep the first non-empty value if a name repeats.
             if name not in props or (not props[name] and value):
                 props[name] = value
         return props
 
-    def _read_collections(self, record_el) -> dict[str, list[dict[str, str]]]:
-        collections: dict[str, list[dict[str, str]]] = {}
-        for coll in self._iter_children(record_el, "Collection"):
+    def _read_collections(self, rec) -> dict[str, list[dict[str, str]]]:
+        out: dict[str, list[dict[str, str]]] = {}
+        for coll in self._iter_children(rec, "Collection"):
             name = coll.get("Name") or coll.get("name") or "Collection"
-            rows: list[dict[str, str]] = []
-            for sub in self._iter_children(coll, "SubRecord", "Record"):
-                rows.append(self._read_properties(sub))
-            collections[name] = rows
-        return collections
+            out[name] = [self._read_properties(sub)
+                         for sub in self._iter_children(coll, "SubRecord", "Record")]
+        return out
 
-    # -- job parsing ----------------------------------------------------------
+    # -- job ------------------------------------------------------------------
 
     def _parse_job(self, job_el) -> ParsedJob:
         job_record = {
-            "identifier": job_el.get("Identifier") or job_el.get("identifier") or "",
+            "identifier": job_el.get("Identifier") or "",
             "date_modified": job_el.get("DateModified") or "",
             "time_modified": job_el.get("TimeModified") or "",
         }
-
         all_records = self._index_records(job_el)
-        root_record = self._find_root_record(all_records)
+        root_record = next(
+            (r for r in all_records.values() if r["type"] in RECORD_TYPES_JOB),
+            {"identifier": "", "type": "", "properties": {}, "collections": {}})
 
-        job_name = (
-            self._first_prop(root_record, *NAME_PROPERTY_CANDIDATES)
-            or job_record["identifier"]
-            or self.path.stem
-        )
+        job_name = (self._first_prop(root_record, *NAME_PROPERTY_CANDIDATES)
+                    or job_record["identifier"] or self.path.stem)
 
-        stages = self._build_stages(all_records)
+        stages, inferred = self._build_stages(all_records)
         links, warnings = self._resolve_links(all_records, stages)
-        annotations = self._collect_annotations(all_records)
-
         self._attach_ports(stages, links)
 
         return ParsedJob(
-            job_name=job_name,
-            source_file=self.path.name,
-            root_record=root_record,
-            job_record=job_record,
-            all_records=all_records,
-            stages=stages,
-            links=links,
-            annotations=annotations,
-            warnings=warnings,
+            job_name=job_name, source_file=self.path.name,
+            root_record=root_record, job_record=job_record, all_records=all_records,
+            stages=stages, links=links,
+            annotations=self._collect_annotations(all_records),
+            warnings=warnings, inferred_types=inferred,
         )
 
     def _index_records(self, job_el) -> dict[str, dict[str, Any]]:
-        """One pass over every <Record>, keyed by Identifier. No interpretation."""
         records: dict[str, dict[str, Any]] = {}
         anon = 0
         for rec in job_el.iter():
@@ -534,154 +414,160 @@ class DataStageParser:
             return None
         props = record.get("properties", {})
         for n in names:
-            v = props.get(n)
-            if v:
-                return v
+            if props.get(n):
+                return props[n]
         return None
 
-    def _find_root_record(self, records: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        for rec in records.values():
-            if rec["type"] in RECORD_TYPES_JOB:
-                return rec
-        return {"identifier": "", "type": "", "properties": {}, "collections": {}}
+    # -- structural classification -------------------------------------------
 
-    def _build_stages(self, records: dict[str, dict[str, Any]]) -> list[Stage]:
+    @staticmethod
+    def _is_port(record: dict[str, Any]) -> bool:
+        rtype = record["type"]
+        if rtype in RECORD_TYPES_INPUT or rtype in RECORD_TYPES_OUTPUT:
+            return True
+        if any(record["properties"].get(p) for p in PARTNER_PROPERTY_CANDIDATES):
+            return True
+        return bool(re.search(r"(input|output)$", rtype, re.IGNORECASE))
+
+    @staticmethod
+    def _is_output_port(record: dict[str, Any]) -> bool:
+        if record["type"] in RECORD_TYPES_OUTPUT:
+            return True
+        if record["type"] in RECORD_TYPES_INPUT:
+            return False
+        return bool(re.search(r"output$", record["type"], re.IGNORECASE))
+
+    @classmethod
+    def _stage_kind(cls, record: dict[str, Any]) -> str:
+        """'known', 'inferred' or '' - inferred means it looks like a stage but
+        its record type is not one we have seen before."""
+        rtype = record["type"]
+        if rtype in RECORD_TYPES_IGNORED or rtype in RECORD_TYPES_JOB \
+                or rtype in RECORD_TYPES_ANNOTATION:
+            return ""
+        if cls._is_port(record):
+            return ""
+        if rtype in RECORD_TYPES_STAGE:
+            return "known"
+        # Anything carrying a stage type, or named like a stage, is a stage.
+        if record["properties"].get("StageType") or rtype.lower().endswith("stage"):
+            return "inferred"
+        return ""
+
+    def _build_stages(self, records: dict[str, dict[str, Any]]) -> tuple[list[Stage], set[str]]:
         stages: list[Stage] = []
+        inferred: set[str] = set()
         for rec in records.values():
-            if rec["type"] in RECORD_TYPES_IGNORED:
+            kind = self._stage_kind(rec)
+            if not kind:
                 continue
-            if rec["type"] not in RECORD_TYPES_STAGE:
-                continue
-            stages.append(
-                Stage(
-                    identifier=rec["identifier"],
-                    name=self._first_prop(rec, *NAME_PROPERTY_CANDIDATES),
-                    stage_type=self._first_prop(rec, *TYPE_PROPERTY_CANDIDATES)
-                    or rec["type"],
-                    properties=dict(rec["properties"]),
-                    collections=dict(rec["collections"]),
-                )
-            )
-        # Stable, human-friendly order: by numeric part of the identifier.
+            if kind == "inferred":
+                inferred.add(rec["type"])
+            stages.append(Stage(
+                identifier=rec["identifier"],
+                name=self._first_prop(rec, *NAME_PROPERTY_CANDIDATES),
+                stage_type=self._first_prop(rec, *TYPE_PROPERTY_CANDIDATES) or rec["type"],
+                properties=dict(rec["properties"]),
+                collections=dict(rec["collections"]),
+                record_type=rec["type"],
+                recognised=(kind == "known"),
+            ))
         stages.sort(key=lambda s: self._identifier_sort_key(s.identifier))
-        return stages
+        return stages, inferred
 
     @staticmethod
     def _identifier_sort_key(ident: str) -> tuple:
         nums = [int(n) for n in re.findall(r"\d+", ident)]
         return (len(nums) == 0, nums, ident)
 
-    # -- link resolution ------------------------------------------------------
-    # An edge in DataStage is a *pair* of port records joined by a Partner
-    # property. Walking outputs only means every edge is produced exactly once.
-
     @classmethod
-    def _owner_of(cls, port_identifier: str) -> str | None:
-        m = _PORT_ID_RE.match(port_identifier)
+    def _owner_of(cls, port_id: str) -> str | None:
+        m = _PORT_ID_RE.match(port_id or "")
         return m.group("stage") if m else None
 
     @classmethod
-    def _port_index(cls, port_identifier: str) -> int | None:
-        m = _PORT_ID_RE.match(port_identifier)
+    def _port_index(cls, port_id: str) -> int | None:
+        m = _PORT_ID_RE.match(port_id or "")
         return int(m.group("port")) if m else None
 
-    def _resolve_links(
-        self, records: dict[str, dict[str, Any]], stages: list[Stage]
-    ) -> tuple[list[Link], list[str]]:
+    # -- links ----------------------------------------------------------------
+    # An edge is a pair of port records joined by Partner. Walking outputs only
+    # means each edge is produced exactly once.
+
+    def _resolve_links(self, records, stages) -> tuple[list[Link], list[str]]:
         stage_ids = {s.identifier for s in stages}
         links: list[Link] = []
         warnings: list[str] = []
 
         for rec in records.values():
-            if rec["type"] not in RECORD_TYPES_OUTPUT:
+            if not self._is_port(rec) or not self._is_output_port(rec):
                 continue
 
             out_id = rec["identifier"]
-            raw_partner = self._first_prop(rec, *PARTNER_PROPERTY_CANDIDATES)
-            partner_stage, partner_port = _parse_partner(raw_partner)
-
-            if not partner_port and not partner_stage:
-                warnings.append(
-                    f"Output port {out_id} declares no partner link; the edge is omitted."
-                )
+            raw = self._first_prop(rec, *PARTNER_PROPERTY_CANDIDATES)
+            partner_stage, partner_port = _parse_partner(raw)
+            if not partner_stage and not partner_port:
+                warnings.append(f"Output port {out_id} declares no partner link.")
                 continue
 
-            # The far stage: a pipe-separated Partner names it outright.
-            to_stage = partner_stage or (self._owner_of(partner_port) if partner_port else None)
-
-            # The near stage: the port on the other end usually points back with
-            # the same stage|port form, which states this stage outright. That is
-            # more reliable than inferring ownership from the identifier, so it is
-            # tried first and the identifier is only a fallback.
-            from_stage = None
+            to_stage = partner_stage or self._owner_of(partner_port or "")
             back = records.get(partner_port or "", {})
-            if back:
-                back_stage, _ = _parse_partner(
-                    self._first_prop(back, *PARTNER_PROPERTY_CANDIDATES)
-                )
-                if back_stage:
-                    from_stage = back_stage
-            if not from_stage:
-                from_stage = self._owner_of(out_id)
+            from_stage = _parse_partner(
+                self._first_prop(back, *PARTNER_PROPERTY_CANDIDATES))[0] \
+                or self._owner_of(out_id)
 
             if not from_stage or not to_stage:
                 warnings.append(
-                    f"Could not determine the stages either side of the link "
-                    f"{out_id} -> {raw_partner}."
-                )
+                    f"Could not determine the stages either side of {out_id} -> {raw}.")
                 continue
             if from_stage not in stage_ids or to_stage not in stage_ids:
                 missing = from_stage if from_stage not in stage_ids else to_stage
                 warnings.append(
-                    f"Link {out_id} -> {raw_partner} references {missing}, which is not "
-                    "documented as a stage in this export. This usually indicates a "
-                    "boundary with a shared container."
-                )
+                    f"Link {out_id} -> {raw} names {missing}, which this export does not "
+                    "describe as a stage. This normally indicates a shared container "
+                    "boundary.")
                 continue
 
             in_rec = records.get(partner_port or "", {})
-            name = (
-                self._first_prop(rec, *NAME_PROPERTY_CANDIDATES)
-                or self._first_prop(in_rec, *NAME_PROPERTY_CANDIDATES)
-            )
+            links.append(Link(
+                name=(self._first_prop(rec, *NAME_PROPERTY_CANDIDATES)
+                      or self._first_prop(in_rec, *NAME_PROPERTY_CANDIDATES)),
+                from_stage=from_stage, to_stage=to_stage,
+                from_port=out_id, to_port=partner_port or "",
+                to_port_index=self._port_index(partner_port or ""),
+                column_count=self._column_count(rec) or self._column_count(in_rec),
+                properties=dict(rec["properties"]),
+            ))
 
-            links.append(
-                Link(
-                    name=name,
-                    from_stage=from_stage,
-                    to_stage=to_stage,
-                    from_port=out_id,
-                    to_port=partner_port or "",
-                    to_port_index=self._port_index(partner_port) if partner_port else None,
-                    properties=dict(rec["properties"]),
-                )
-            )
-
-        self._flag_reference_links(links, stages)
+        self._flag_link_kinds(links, stages)
         return links, warnings
 
-    def _flag_reference_links(self, links: list[Link], stages: list[Stage]) -> None:
-        """
-        Mark links that feed a lookup-style stage on a non-primary input port.
+    @staticmethod
+    def _column_count(record: dict[str, Any]) -> int | None:
+        for name, rows in (record.get("collections") or {}).items():
+            if "column" in name.lower():
+                return len(rows)
+        return None
 
-        DataStage carries no explicit "this is reference data" flag on the link,
-        so this is a derivation, not a reading. Two signals are used, in order:
-        an explicit LinkType property where the export provides one, otherwise
-        the port index on a lookup/join/merge consumer.
-        """
+    def _flag_link_kinds(self, links: list[Link], stages: list[Stage]) -> None:
+        """Reference and reject are derivations - DataStage flags neither."""
         by_id = {s.identifier: s for s in stages}
         for link in links:
-            explicit = link.properties.get("LinkType", "").strip().lower()
-            if explicit in ("reference", "2"):
+            explicit = (link.properties.get("LinkType") or "").strip().lower()
+            if explicit in ("reference", "lookup"):
                 link.is_reference = True
-                continue
+            elif explicit in ("reject", "rejects"):
+                link.is_reject = True
+
+            name = (link.name or "").lower()
+            if any(k in name for k in ("rej", "err", "bad")):
+                link.is_reject = True
+
             target = by_id.get(link.to_stage)
-            if not target or not target.stage_type:
+            if link.is_reference or not target or not target.stage_type:
                 continue
-            stype = target.stage_type.lower()
-            if not any(h in stype for h in REFERENCE_CONSUMER_HINTS):
-                continue
-            if link.to_port_index is not None and link.to_port_index > 1:
+            if any(h in target.stage_type.lower() for h in REFERENCE_CONSUMER_HINTS) \
+                    and (link.to_port_index or 1) > 1:
                 link.is_reference = True
 
     def _attach_ports(self, stages: list[Stage], links: list[Link]) -> None:
@@ -692,8 +578,8 @@ class DataStageParser:
             if link.to_stage in by_id:
                 by_id[link.to_stage].inputs.append(link.display_name)
 
-    def _collect_annotations(self, records: dict[str, dict[str, Any]]) -> list[str]:
-        notes: list[str] = []
+    def _collect_annotations(self, records) -> list[str]:
+        notes = []
         for rec in records.values():
             if rec["type"] not in RECORD_TYPES_ANNOTATION:
                 continue
@@ -704,9 +590,9 @@ class DataStageParser:
 
 
 # =============================================================================
-# SECTION C   GRAPH ANALYSIS
+# SECTION C   ANALYSIS
 # =============================================================================
-# Stages and links to derived facts: roles, paths, observations.
+# Stages and links to derived facts: roles, paths, findings.
 
 ROLE_SOURCE = "source"
 ROLE_REFERENCE = "reference"
@@ -724,7 +610,7 @@ ROLE_LABELS = {
 
 
 @dataclass
-class Observation:
+class Finding:
     ref: str
     category: str
     obj: str
@@ -738,14 +624,13 @@ class WorkflowGraph:
     references: list[Stage] = field(default_factory=list)
     transformations: list[Stage] = field(default_factory=list)
     targets: list[Stage] = field(default_factory=list)
-    data_objects: list[Stage] = field(default_factory=list)   # unclassified
-    paths: list[list[str]] = field(default_factory=list)      # stage names
+    data_objects: list[Stage] = field(default_factory=list)
+    paths: list[list[str]] = field(default_factory=list)
     paths_truncated: bool = False
     total_path_count: int = 0
     has_cycles: bool = False
-    observations: list[Observation] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
 
-    # -- convenience for the builder -----------------------------------------
     @property
     def stages(self) -> list[Stage]:
         return self.job.stages
@@ -757,88 +642,65 @@ class WorkflowGraph:
     def outgoing(self, stage: Stage) -> list[Link]:
         return [l for l in self.links if l.from_stage == stage.identifier]
 
+    def name_of(self, stage_id: str) -> str:
+        for s in self.stages:
+            if s.identifier == stage_id:
+                return s.display_name
+        return stage_id
+
 
 def analyze(job: ParsedJob) -> WorkflowGraph:
     graph = WorkflowGraph(job=job)
     _classify_roles(job)
     for s in job.stages:
-        if s.role == ROLE_SOURCE:
-            graph.sources.append(s)
-        elif s.role == ROLE_REFERENCE:
-            graph.references.append(s)
-        elif s.role == ROLE_TRANSFORMATION:
-            graph.transformations.append(s)
-        elif s.role == ROLE_TARGET:
-            graph.targets.append(s)
-        else:
-            graph.data_objects.append(s)
+        {ROLE_SOURCE: graph.sources, ROLE_REFERENCE: graph.references,
+         ROLE_TRANSFORMATION: graph.transformations, ROLE_TARGET: graph.targets,
+         ROLE_UNCLASSIFIED: graph.data_objects}[s.role].append(s)
 
-    paths, truncated, cycles, total = _enumerate_paths(job, graph)
-    graph.paths = paths
-    graph.paths_truncated = truncated
-    graph.has_cycles = cycles
-    graph.total_path_count = total
-
-    graph.observations = _build_observations(job, graph)
+    graph.paths, graph.paths_truncated, graph.has_cycles, graph.total_path_count = \
+        _enumerate_paths(job, graph)
+    graph.findings = _build_findings(job, graph)
     return graph
 
 
 def _classify_roles(job: ParsedJob) -> None:
-    """
-    Roles are derived from link degree - DataStage carries no source/target flag.
-
-    Order matters. A stage with no links at all is left unclassified rather than
-    being called a source, because an isolated object on the canvas is not an
-    input to anything.
-    """
-    in_deg: dict[str, int] = {s.identifier: 0 for s in job.stages}
-    out_deg: dict[str, int] = {s.identifier: 0 for s in job.stages}
+    """Roles come from link degree - DataStage carries no source/target flag."""
+    in_deg = {s.identifier: 0 for s in job.stages}
+    out_deg = {s.identifier: 0 for s in job.stages}
     for l in job.links:
         if l.from_stage in out_deg:
             out_deg[l.from_stage] += 1
         if l.to_stage in in_deg:
             in_deg[l.to_stage] += 1
 
-    # A source whose every outgoing link is a reference link is reference data.
     for s in job.stages:
         i, o = in_deg[s.identifier], out_deg[s.identifier]
-
         if i == 0 and o == 0:
             s.role = ROLE_UNCLASSIFIED
         elif i == 0:
             out_links = [l for l in job.links if l.from_stage == s.identifier]
-            if out_links and all(l.is_reference for l in out_links):
-                s.role = ROLE_REFERENCE
-            else:
-                s.role = ROLE_SOURCE
+            s.role = ROLE_REFERENCE if out_links and all(
+                l.is_reference for l in out_links) else ROLE_SOURCE
         elif o == 0:
             s.role = ROLE_TARGET
         else:
             s.role = ROLE_TRANSFORMATION
 
 
-def _enumerate_paths(
-    job: ParsedJob, graph: WorkflowGraph
-) -> tuple[list[list[str]], bool, bool, int]:
-    """
-    Every walk from a source or reference to a target.
-
-    Three guards, because real workflows fan out and the count grows fast:
-    a cycle guard (DataStage permits cycles, so this is a note, not an error),
-    a depth guard, and a volume guard that reports the true count when it trips.
-    """
+def _enumerate_paths(job, graph) -> tuple[list[list[str]], bool, bool, int]:
+    """Every walk from a source or reference to a target, with three guards:
+    cycles, depth, and volume."""
     adjacency: dict[str, list[str]] = {s.identifier: [] for s in job.stages}
     for l in job.links:
         if l.from_stage in adjacency:
             adjacency[l.from_stage].append(l.to_stage)
 
     names = {s.identifier: s.display_name for s in job.stages}
-    target_ids = {s.identifier for s in graph.targets}
-    starts = [s.identifier for s in graph.sources] + [s.identifier for s in graph.references]
+    targets = {s.identifier for s in graph.targets}
+    starts = [s.identifier for s in graph.sources + graph.references]
 
     paths: list[list[str]] = []
-    truncated = False
-    cycles = False
+    truncated = cycles = False
     total = 0
 
     def walk(node: str, trail: list[str], on_path: set[str]) -> None:
@@ -846,7 +708,7 @@ def _enumerate_paths(
         if len(trail) > MAX_PATH_DEPTH:
             truncated = True
             return
-        if node in target_ids or not adjacency.get(node):
+        if node in targets or not adjacency.get(node):
             total += 1
             if len(paths) < MAX_PATHS:
                 paths.append([names.get(n, n) for n in trail])
@@ -861,17 +723,12 @@ def _enumerate_paths(
 
     for start in starts:
         walk(start, [start], {start})
-
     return paths, truncated, cycles, total
 
 
 def _consistency_problems(job: ParsedJob, graph: WorkflowGraph) -> list[str]:
-    """Cross-check the report's own numbers against the parsed graph.
-
-    These invariants should never fail. If one does, something in the parse or
-    the analysis is wrong, and it is better for the report to say so than to
-    print a confident number nobody can trust.
-    """
+    """Invariants that should never fail. Better for the report to say something
+    is wrong than to print a confident number nobody can trust."""
     problems: list[str] = []
     by_id = {s.identifier: s for s in graph.stages}
     names = {s.display_name for s in graph.stages}
@@ -883,275 +740,138 @@ def _consistency_problems(job: ParsedJob, graph: WorkflowGraph) -> list[str]:
                   + len(graph.transformations) + len(graph.targets))
     if classified + len(graph.data_objects) != len(graph.stages):
         problems.append(
-            f"Stage counts disagree: {classified} classified by role plus "
-            f"{len(graph.data_objects)} unclassified is "
-            f"{classified + len(graph.data_objects)}, but Section 2 lists "
-            f"{len(graph.stages)} stages.")
+            f"Stage counts disagree: {classified} classified plus "
+            f"{len(graph.data_objects)} unclassified is {classified + len(graph.data_objects)}, "
+            f"but the inventory lists {len(graph.stages)}.")
 
-    for link in graph.links:
-        if link.from_stage not in by_id or link.to_stage not in by_id:
+    in_deg = {i: 0 for i in by_id}
+    out_deg = {i: 0 for i in by_id}
+    for l in graph.links:
+        if l.from_stage not in by_id or l.to_stage not in by_id:
+            problems.append(f"Link {l.display_name} connects a stage the report does not list.")
+            break
+        out_deg[l.from_stage] += 1
+        in_deg[l.to_stage] += 1
+
+    for s in graph.stages:
+        if len(s.inputs) != in_deg.get(s.identifier, 0) or \
+                len(s.outputs) != out_deg.get(s.identifier, 0):
             problems.append(
-                f"Link {link.display_name} connects a stage that Section 2 does not list.")
+                f"The link counts shown for {s.display_name} do not match the link inventory.")
             break
 
-    in_deg: dict[str, int] = {i: 0 for i in by_id}
-    out_deg: dict[str, int] = {i: 0 for i in by_id}
-    for link in graph.links:
-        if link.from_stage in out_deg:
-            out_deg[link.from_stage] += 1
-        if link.to_stage in in_deg:
-            in_deg[link.to_stage] += 1
-    for stage in graph.stages:
-        if len(stage.inputs) != in_deg[stage.identifier] or \
-                len(stage.outputs) != out_deg[stage.identifier]:
-            problems.append(
-                f"The link counts shown for {stage.display_name} do not match the links "
-                "listed in Section 3.")
+    for s in graph.sources + graph.references:
+        if in_deg.get(s.identifier):
+            problems.append(f"{s.display_name} is listed as an input but has incoming links.")
             break
-
-    for stage in graph.sources + graph.references:
-        if in_deg[stage.identifier]:
-            problems.append(f"{stage.display_name} is listed as an input but has incoming links.")
-            break
-    for stage in graph.targets:
-        if out_deg[stage.identifier]:
-            problems.append(f"{stage.display_name} is listed as a target but has outgoing links.")
+    for s in graph.targets:
+        if out_deg.get(s.identifier):
+            problems.append(f"{s.display_name} is listed as a target but has outgoing links.")
             break
 
     for path in graph.paths:
         unknown = [n for n in path if n not in names]
         if unknown:
-            problems.append(
-                f"A path in Section 8 names {unknown[0]}, which Section 2 does not list.")
+            problems.append(f"A path names {unknown[0]}, which the inventory does not list.")
             break
 
     return problems
 
 
-def _build_observations(job: ParsedJob, graph: WorkflowGraph) -> list[Observation]:
-    """Section 9. Records both exceptions and the fact that checks were run."""
-    obs: list[Observation] = []
+def _build_findings(job: ParsedJob, graph: WorkflowGraph) -> list[Finding]:
+    findings: list[Finding] = []
 
     def add(category: str, obj: str, text: str) -> None:
-        obs.append(Observation(f"OBS-{len(obs) + 1:02d}", category, obj, text))
-
-    for w in job.warnings:
-        m = re.search(r"\b([A-Za-z0-9_]*S\d+(?:P\d+)?)\b", w)
-        add("Unresolved reference", m.group(1) if m else TEXT_NOT_APPLICABLE, w)
-
-    for s in job.stages:
-        if s.name is None:
-            add(
-                "Incomplete metadata",
-                s.identifier,
-                f"The object does not carry a technical name in this export. It is listed in "
-                f"Section 2 as {TEXT_NOT_IDENTIFIED.lower()}, and no role has been assigned to it.",
-            )
-
-    for s in graph.data_objects:
-        if s.name is not None:
-            add(
-                "Isolated object",
-                s.identifier,
-                f"{s.display_name} declares no input or output links and does not participate "
-                "in any data path. It is listed in Section 2 but does not appear in Section 3.",
-            )
+        findings.append(Finding(f"F-{len(findings) + 1:02d}", category, obj, text))
 
     for problem in _consistency_problems(job, graph):
         add("Internal inconsistency", TEXT_NOT_APPLICABLE,
             problem + " This report should not be relied on until it is resolved.")
 
+    for w in job.warnings:
+        m = re.search(r"\b([A-Za-z0-9_]*S\d+(?:P\d+)?)\b", w)
+        add("Unresolved reference", m.group(1) if m else TEXT_NOT_APPLICABLE, w)
+
+    unnamed = [s for s in graph.stages if s.name is None]
+    if unnamed:
+        add("Incomplete metadata", ", ".join(s.identifier for s in unnamed[:4]),
+            f"{len(unnamed)} object(s) carry no technical name in this export and are listed "
+            f"as {TEXT_NOT_IDENTIFIED.lower()}.")
+
+    no_object = [s for s in graph.sources + graph.targets if not stage_object(s)]
+    if no_object:
+        add("Incomplete metadata", ", ".join(s.identifier for s in no_object[:4]),
+            f"{len(no_object)} source or target record no table or file name in this export, "
+            "so their Object entries read as not identified.")
+
+    for s in graph.data_objects:
+        label = s.name or f"The object {s.identifier}"
+        add("Isolated object", s.identifier,
+            f"{label} declares no links and takes no part in any data path.")
+
+    if job.inferred_types:
+        add("Unfamiliar record type", ", ".join(sorted(job.inferred_types)),
+            "These record types were not previously known but carry stage properties, so they "
+            "are documented as stages. Confirm they are stages rather than definitions.")
+
     if graph.has_cycles:
-        add(
-            "Cyclic route",
-            TEXT_NOT_APPLICABLE,
-            "One or more cyclic routes were detected during path enumeration. Affected branches "
-            "were terminated at the point of repetition, so Section 8 does not represent the "
-            "complete set of paths through the workflow.",
-        )
-
+        add("Cyclic route", TEXT_NOT_APPLICABLE,
+            "Cyclic routes were found. Affected branches were terminated at the point of "
+            "repetition, so the path list is not the complete set.")
     if graph.paths_truncated:
-        add(
-            "Enumeration limit",
-            TEXT_NOT_APPLICABLE,
-            f"Path enumeration reached the applicable limit. {graph.total_path_count} paths were "
-            f"identified in total and the first {len(graph.paths)} are listed in Section 8.",
-        )
-    elif not graph.has_cycles:
-        add(
-            "Completeness",
-            TEXT_NOT_APPLICABLE,
-            "Path enumeration completed within the applicable limits and no cyclic routes were "
-            "detected. Section 8 therefore represents the complete set of paths through the "
-            "workflow.",
-        )
-
-    return obs
+        add("Enumeration limit", TEXT_NOT_APPLICABLE,
+            f"{graph.total_path_count} paths were found in total and the first "
+            f"{len(graph.paths)} are listed.")
+    if not graph.has_cycles and not graph.paths_truncated:
+        add("Completeness", TEXT_NOT_APPLICABLE,
+            "Every record type was recognised, every stage classified, and path enumeration "
+            "completed with no cyclic routes.")
+    return findings
 
 
-# =============================================================================
-# SECTION D   NARRATIVE GENERATION (LLM)
-# =============================================================================
-# The crew explains parsed facts. It never supplies a value that appears in a
-# table, and the report still generates without it.
+# --- what a source or target reads from or writes to --------------------------
 
-@dataclass
-class Narrative:
-    architecture_diagram: str = ""
-    architecture_description: str = ""
-    entity_descriptions: dict[str, str] = field(default_factory=dict)   # stage name -> text
-    path_explanations: dict[int, str] = field(default_factory=dict)     # 1-based index -> text
-    path_summary: str = ""
-    unverified_identifiers: list[str] = field(default_factory=list)
-
-
-def build_factsheet(graph: WorkflowGraph) -> dict[str, Any]:
-    """
-    A trimmed, token-bounded view of the workflow for the model.
-
-    all_records is deliberately excluded - for a real job it is tens of thousands
-    of tokens of port-identifier noise with no explanatory value.
-    """
-    def stage_entry(s: Stage) -> dict[str, Any]:
-        return {
-            "name": s.display_name,
-            "id": s.identifier,
-            "type": s.display_type,
-            "role": ROLE_LABELS.get(s.role, s.role),
-            "inputs": s.inputs,
-            "outputs": s.outputs,
-            "key_properties": _interesting_properties(s),
-        }
-
-    return {
-        "job_name": graph.job.job_name,
-        "source_file": graph.job.source_file,
-        "counts": {
-            "sources": len(graph.sources),
-            "references": len(graph.references),
-            "transformations": len(graph.transformations),
-            "targets": len(graph.targets),
-            "total_stages": len(graph.stages) - len(graph.data_objects),
-        },
-        "sources": [stage_entry(s) for s in graph.sources],
-        "references": [stage_entry(s) for s in graph.references],
-        "transformations": [stage_entry(s) for s in graph.transformations],
-        "targets": [stage_entry(s) for s in graph.targets],
-        "links": [
-            {
-                "name": l.display_name,
-                "from": _name_of(graph, l.from_stage),
-                "to": _name_of(graph, l.to_stage),
-                "reference": l.is_reference,
-            }
-            for l in graph.links
-        ],
-        "paths": [{"index": i + 1, "stages": p} for i, p in enumerate(graph.paths)],
-        "designer_annotations": graph.job.annotations[:20],
-    }
-
-
-# Properties worth showing a reader, per stage family. Anything not listed stays
-# in all_records; dumping every DataStage property produces noise, not detail.
-INTERESTING_PROPERTY_NAMES = (
-    "Name", "StageType", "TableName", "SelectStatement", "Query", "SQL",
-    "FileName", "Filename", "Directory", "ReadMethod", "WriteMode", "WriteMethod",
-    "UpdateAction", "InsertAction", "Partitioning", "PartitionType", "SortKey",
-    "LookupType", "LookupFail", "Condition", "Constraint", "Derivation",
-    "BusinessKey", "SurrogateKey", "CommitInterval", "ArraySize", "DSN",
-    "DatabaseName", "SchemaName", "FunnelType",
-)
-
-
-def _interesting_properties(stage: Stage, limit: int = 8) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key in INTERESTING_PROPERTY_NAMES:
-        val = stage.properties.get(key)
-        if val:
-            out[key] = val[:300]
-        if len(out) >= limit:
-            break
-    return out
-
-
-# What a source or target reads from or writes to.
 OBJECT_PROPERTY_CANDIDATES = (
     "TableName", "Table_name", "TableNameInput", "Table", "TargetTable",
     "FileName", "Filename", "File", "FilePath", "Path", "Directory",
     "SelectStatement", "Select_Statement", "SQLStatement", "SQL", "Query",
-    "Source", "DataSource", "DSN", "DatabaseName", "SchemaName",
+    "Source", "DataSource", "DatabaseName", "SchemaName",
 )
-# Tag names to look for inside a connector's nested XML configuration.
-OBJECT_XML_TAGS = (
-    "TableName", "Table", "SelectStatement", "SQL", "Query", "FileName",
-    "File", "Path", "Schema", "TargetTable",
-)
-XML_BLOB_PROPERTY_HINTS = ("XMLProperties", "Properties", "StageProperties", "Config")
-# Connector stages keep their configuration in collection rows, usually as
-# name/value pairs.
-OBJECT_COLLECTION_HINTS = ("Properties", "MetaBag", "PropertyList", "StageProperties")
+OBJECT_XML_TAGS = ("TableName", "Table", "SelectStatement", "SQL", "Query",
+                   "FileName", "File", "Path", "TargetTable")
+# MetaBag is absent on purpose: it holds column metadata and encoded internals.
+OBJECT_COLLECTION_HINTS = ("Properties", "PropertyList", "StageProperties", "Usage")
 COLLECTION_KEY_FIELDS = ("Name", "PropertyName", "Key", "Id")
 COLLECTION_VALUE_FIELDS = ("Value", "PropertyValue", "Data", "Text")
 
-
-def stage_object(stage: Stage) -> str | None:
-    """The table, file or query a stage reads from or writes to, if recorded."""
-    flat = stage.prop(*OBJECT_PROPERTY_CANDIDATES)
-    if flat:
-        return _tidy_object(flat)
-
-    # Connector stages record their configuration as collection rows.
-    from_collection = _search_collections(stage)
-    if from_collection:
-        return _tidy_object(from_collection)
-
-    # Some record it as an XML string on a property instead.
-    for key, value in stage.properties.items():
-        if not value or "<" not in value:
-            continue
-        if not (any(h.lower() in key.lower() for h in XML_BLOB_PROPERTY_HINTS)
-                or value.lstrip().startswith("<")):
-            continue
-        found = _search_xml_blob(value)
-        if found:
-            return _tidy_object(found)
-    return None
+_OBJECT_ALLOWED = re.compile(r"^[\w\s.,;:*=<>()\[\]{}'\"/\\$#@%+?!|-]+$")
 
 
-def _search_collections(stage: Stage) -> str | None:
-    """Look through a stage's collection rows for a table, file or query."""
-    wanted = {c.lower() for c in OBJECT_PROPERTY_CANDIDATES}
-    fallback: str | None = None
+def _looks_like_object(text: str) -> bool:
+    """A table name, path or query has separators. A long run without one is an
+    encoded value, not something to print."""
+    text = (text or "").strip()
+    if not (2 <= len(text) <= 4000):
+        return False
+    if any(ord(c) < 32 and c not in "\t\n\r" for c in text):
+        return False
+    if not _OBJECT_ALLOWED.match(text):
+        return False
+    if sum(c.isalpha() for c in text) < max(2, len(text) * 0.30):
+        return False
+    unbroken = max((len(r) for r in re.split(r"[\s_./\\-]+", text) if r), default=0)
+    return unbroken <= 40
 
-    for name, rows in stage.collections.items():
-        if not any(h.lower() in name.lower() for h in OBJECT_COLLECTION_HINTS):
-            continue
-        for row in rows:
-            # Name/value pair rows.
-            key = next((row[f] for f in COLLECTION_KEY_FIELDS if row.get(f)), None)
-            value = next((row[f] for f in COLLECTION_VALUE_FIELDS if row.get(f)), None)
-            if key and value and key.lower() in wanted:
-                return value
-            if key and value and "<" in value:
-                found = _search_xml_blob(value)
-                if found:
-                    return found
-            # Rows that carry the property directly as a field.
-            for field, field_value in row.items():
-                if not field_value:
-                    continue
-                if field.lower() in wanted:
-                    return field_value
-                if "<" in field_value and fallback is None:
-                    fallback = _search_xml_blob(field_value)
-    return fallback
+
+def _tidy_object(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= 160 else text[:159] + TRUNCATION_MARK
 
 
 def _search_xml_blob(blob: str) -> str | None:
     try:
         from lxml import etree
-        root = etree.fromstring(blob.encode("utf-8", "ignore"),
-                                etree.XMLParser(recover=True))
+        root = etree.fromstring(blob.encode("utf-8", "ignore"), etree.XMLParser(recover=True))
     except Exception:
         return None
     if root is None:
@@ -1166,62 +886,119 @@ def _search_xml_blob(blob: str) -> str | None:
     return None
 
 
-def _tidy_object(text: str) -> str:
-    """Collapse a multi-line SQL statement so it fits a table cell."""
-    text = " ".join(text.split())
-    return text if len(text) <= 160 else text[:159] + "\u2026"
+def _search_collections(stage: Stage) -> str | None:
+    wanted = {c.lower() for c in OBJECT_PROPERTY_CANDIDATES}
+    fallback = None
+    for name, rows in stage.collections.items():
+        if not any(h.lower() in name.lower() for h in OBJECT_COLLECTION_HINTS):
+            continue
+        for row in rows:
+            key = next((row[f] for f in COLLECTION_KEY_FIELDS if row.get(f)), None)
+            value = next((row[f] for f in COLLECTION_VALUE_FIELDS if row.get(f)), None)
+            if not value:
+                continue
+            if key and key.lower() in wanted and _looks_like_object(value):
+                return value
+            if "<" in value and fallback is None:
+                found = _search_xml_blob(value)
+                if found and _looks_like_object(found):
+                    fallback = found
+    return fallback
 
 
-def _name_of(graph: WorkflowGraph, stage_id: str) -> str:
-    for s in graph.stages:
-        if s.identifier == stage_id:
-            return s.display_name
-    return stage_id
+def stage_object(stage: Stage) -> str | None:
+    """Connector stages keep this in collection rows; older stages in properties."""
+    flat = stage.prop(*OBJECT_PROPERTY_CANDIDATES)
+    if flat and _looks_like_object(flat):
+        return _tidy_object(flat)
+
+    from_collection = _search_collections(stage)
+    if from_collection:
+        return _tidy_object(from_collection)
+
+    for key, value in stage.properties.items():
+        if value and value.lstrip().startswith("<"):
+            found = _search_xml_blob(value)
+            if found and _looks_like_object(found):
+                return _tidy_object(found)
+    return None
 
 
-def known_identifiers(graph: WorkflowGraph) -> set[str]:
-    known = {s.display_name for s in graph.stages}
-    known |= {l.display_name for l in graph.links}
-    known |= {s.display_type for s in graph.stages}
-    known.add(graph.job.job_name)
-    return {k for k in known if k}
+# =============================================================================
+# SECTION D   NARRATIVE
+# =============================================================================
+# The crew explains parsed facts. It never supplies a value that appears in a
+# table, and the report still generates without it.
+
+@dataclass
+class Narrative:
+    summary: str = ""
+    stage_descriptions: dict[str, str] = field(default_factory=dict)
+    path_explanations: dict[int, str] = field(default_factory=dict)
+    design_findings: list[tuple[str, str]] = field(default_factory=list)
+    unverified_identifiers: list[str] = field(default_factory=list)
 
 
-def generate_narrative(graph: WorkflowGraph) -> Narrative:
-    """
-    Runs the crew. Returns an empty Narrative rather than raising - a factual
-    report without prose is useful, a failed download is not.
-    """
-    if not LLM_ENABLED:
-        log.info("LLM disabled; generating tables only.")
-        return Narrative(architecture_diagram=build_arrow_diagram(graph))
+# The model writes markdown, runs long, and wraps lines. Everything reaching the
+# page goes through these first.
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
+_MD_BULLET_RE = re.compile(r"^\s*[-*+]\s+", re.M)
+_MD_CODE_RE = re.compile(r"`{1,3}([^`]*)`{1,3}", re.S)
+# Underscore markdown is not handled: DataStage names are full of underscores
+# and treating them as emphasis rewrites EDW_STG.CUST into EDWSTG.CUST.
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s|\*)(.+?)(?<!\s)\*(?!\*)", re.S)
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 
-    factsheet = build_factsheet(graph)
-    raw: dict[str, Any] = {}
-    for attempt in range(LLM_MAX_RETRIES + 1):
-        try:
-            raw = _run_crew(factsheet)
+
+def clean_text(text: Any, markdown: bool = False) -> str:
+    """Markdown is stripped only from model-written text: doing it everywhere ate
+    the leading # of labels such as '# of sources'."""
+    if text is None:
+        return ""
+    out = str(text)
+    if markdown:
+        out = _MD_HEADING_RE.sub("", out)
+        out = _MD_BULLET_RE.sub("", out)
+        out = _MD_CODE_RE.sub(r"\1", out)
+        out = _MD_BOLD_RE.sub(r"\1", out)
+        out = _MD_ITALIC_RE.sub(r"\1", out)
+    out = out.replace(" ", " ")
+    out = "".join(c for c in out if c in "\n\t" or ord(c) >= 32)
+    out = re.sub(r"[-￰-￿]", "", out)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    joined = [l + ("." if i < len(lines) - 1 and not l.endswith((".", "!", "?", ":", ";", ",")) else "")
+              for i, l in enumerate(lines)]
+    return re.sub(r"\s+", " ", " ".join(joined)).strip()
+
+
+def truncate_at_sentence(text: str, limit: int) -> str:
+    if not text or len(text) <= limit:
+        return text
+    window = text[: limit + 1]
+    ends = [m.end() for m in _SENTENCE_END_RE.finditer(window)]
+    if ends and ends[-1] >= limit * 0.55:
+        return window[: ends[-1]].strip()
+    return window.rsplit(" ", 1)[0].rstrip(" ,;:-") + TRUNCATION_MARK
+
+
+def limit_prose(text: str) -> list[str]:
+    if not text:
+        return []
+    blocks = [clean_text(b, markdown=True)
+              for b in re.split(r"\n\s*\n|\n", str(text)) if b.strip()]
+    blocks = [b for b in blocks if b][:MAX_PROSE_PARAGRAPHS]
+    kept, budget = [], MAX_PROSE_CHARS
+    for block in blocks:
+        if budget <= 0:
             break
-        except Exception as exc:
-            log.warning("Narrative generation attempt %s failed: %s", attempt + 1, exc)
-    if not raw:
-        log.warning("Narrative generation unavailable; continuing with tables only.")
-        return Narrative(architecture_diagram=build_arrow_diagram(graph))
-
-    narrative = _assemble_narrative(raw, graph)
-    narrative.unverified_identifiers = _validate_narrative(narrative, graph)
-    if narrative.unverified_identifiers:
-        log.warning(
-            "Narrative mentions identifiers absent from the export: %s",
-            ", ".join(narrative.unverified_identifiers),
-        )
-    return narrative
+        kept.append(truncate_at_sentence(block, budget) if len(block) > budget else block)
+        budget -= len(kept[-1])
+    return kept
 
 
 def _load_config_module():
-    """The project's own settings module, if it is importable from here."""
     import importlib
-
     for name in LLM_CONFIG_MODULES:
         try:
             return importlib.import_module(name)
@@ -1231,7 +1008,6 @@ def _load_config_module():
 
 
 def _llm_setting(kind: str, module) -> str | None:
-    """A setting from the project's config module, else the environment."""
     for attr in LLM_CONFIG_NAMES[kind]:
         if module is not None:
             value = getattr(module, attr, None)
@@ -1245,25 +1021,19 @@ def _llm_setting(kind: str, module) -> str | None:
 
 def _build_llm():
     module = _load_config_module()
-
-    # If the project already builds a client, reuse it. Constructing a second
-    # one risks disagreeing with whatever patches the project applies to it.
     if module is not None:
         for attr in LLM_INSTANCE_NAMES:
             candidate = getattr(module, attr, None)
-            if candidate is not None and isinstance(candidate, AzureChatOpenAI):
-                log.info("Reusing the AzureChatOpenAI client from %s.%s",
-                         module.__name__, attr)
+            if isinstance(candidate, AzureChatOpenAI):
+                log.info("Reusing the AzureChatOpenAI client from %s.%s", module.__name__, attr)
                 return candidate
 
     deployment = _llm_setting("deployment", module)
     if not deployment:
-        looked = ", ".join(LLM_CONFIG_NAMES["deployment"][:4])
         raise RuntimeError(
             "No Azure deployment name found. Looked for "
-            f"{looked} in {module.__name__ if module else 'the environment'}. "
-            "Add the correct attribute name to LLM_CONFIG_NAMES in generate_doc.py."
-        )
+            f"{', '.join(LLM_CONFIG_NAMES['deployment'][:4])} in "
+            f"{module.__name__ if module else 'the environment'}.")
 
     kwargs: dict[str, Any] = {
         "azure_deployment": deployment,
@@ -1271,150 +1041,182 @@ def _build_llm():
         "temperature": LLM_TEMPERATURE,
         "timeout": LLM_TIMEOUT_SECONDS,
     }
-    # Only pass these when found; otherwise langchain reads them from the
-    # environment itself, which is the documented behaviour.
-    endpoint = _llm_setting("endpoint", module)
-    api_key = _llm_setting("api_key", module)
-    if endpoint:
-        kwargs["azure_endpoint"] = endpoint
-    if api_key:
-        kwargs["api_key"] = api_key
-
-    log.info(
-        "Azure client: deployment=%s endpoint=%s key=%s (from %s)",
-        deployment,
-        "set" if endpoint else "from environment",
-        "set" if api_key else "from environment",
-        module.__name__ if module else "environment",
-    )
+    for key, kind in (("azure_endpoint", "endpoint"), ("api_key", "api_key")):
+        value = _llm_setting(kind, module)
+        if value:
+            kwargs[key] = value
+    log.info("Azure client: deployment=%s (from %s)", deployment,
+             module.__name__ if module else "environment")
     return AzureChatOpenAI(**kwargs)
 
 
-GROUNDING_RULES = """
+GROUNDING_RULES = f"""
 Rules that override every other instruction:
-- Use ONLY the names that appear in the factsheet. Never invent a stage, link,
-  table, file or column name.
-- If a fact is not in the factsheet, write "not specified in the export".
-- Write in measured business English. No marketing language, no metaphors, no
-  exclamation marks, no bullet fragments - complete sentences only.
-- Do not describe what you were asked to do, and do not refer to the factsheet,
-  the model or this report in your output.
-- Return valid JSON only. No markdown fences, no commentary before or after.
-- Plain text inside every JSON string. No markdown: no **bold**, no `backticks`,
-  no bullet characters, no headings, no newlines inside a description.
-- Respect every length limit given below. Text over the limit is trimmed before
-  it reaches the document, so writing more only loses your closing sentence.
+- Use ONLY the names in the factsheet. Never invent a stage, link, table, file or
+  column name. If a fact is not there, write "not specified in the export".
+- Measured business English. Complete sentences, no marketing language, no
+  metaphors, no bullet fragments.
+- Do not mention the factsheet, the model or this report.
+- Plain text inside every JSON string: no markdown, no newlines.
+- Respect the length limits. Text over the limit is trimmed, so writing more only
+  loses your closing sentence.
+- Return valid JSON only, with no fences and no commentary.
 """
+
+
+def build_factsheet(graph: WorkflowGraph) -> dict[str, Any]:
+    """A trimmed view for the model. all_records is excluded: for a real job it
+    is tens of thousands of tokens of port-identifier noise."""
+    def entry(s: Stage) -> dict[str, Any]:
+        return {"name": s.display_name, "id": s.identifier, "type": s.display_type,
+                "role": ROLE_LABELS[s.role], "inputs": s.inputs, "outputs": s.outputs,
+                "object": stage_object(s), "key_properties": _interesting_properties(s)}
+
+    return {
+        "job_name": graph.job.job_name,
+        "source_file": graph.job.source_file,
+        "sources": [entry(s) for s in graph.sources],
+        "references": [entry(s) for s in graph.references],
+        "transformations": [entry(s) for s in graph.transformations],
+        "targets": [entry(s) for s in graph.targets],
+        "links": [{"name": l.display_name, "from": graph.name_of(l.from_stage),
+                   "to": graph.name_of(l.to_stage), "kind": l.kind} for l in graph.links],
+        "paths": [{"index": i + 1, "stages": p} for i, p in enumerate(graph.paths)],
+        "designer_notes": graph.job.annotations[:20],
+    }
+
+
+INTERESTING_PROPERTY_NAMES = (
+    "StageType", "TableName", "SelectStatement", "Query", "SQL", "FileName",
+    "ReadMethod", "WriteMode", "WriteMethod", "UpdateAction", "Partitioning",
+    "LookupType", "Condition", "Constraint", "Derivation", "JoinType",
+    "BusinessKey", "SurrogateKey", "SortKey", "FunnelType",
+)
+
+
+def _interesting_properties(stage: Stage, limit: int = 8) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in INTERESTING_PROPERTY_NAMES:
+        value = stage.properties.get(key)
+        if value:
+            out[key] = value[:300]
+        if len(out) >= limit:
+            break
+    return out
+
+
+def known_identifiers(graph: WorkflowGraph) -> set[str]:
+    known = {s.display_name for s in graph.stages}
+    known |= {l.display_name for l in graph.links}
+    known |= {s.display_type for s in graph.stages}
+    known |= {stage_object(s) or "" for s in graph.stages}
+    known.add(graph.job.job_name)
+    return {k for k in known if k}
+
+
+def generate_narrative(graph: WorkflowGraph) -> Narrative:
+    """Returns an empty Narrative rather than raising: a factual report without
+    prose is useful, a failed download is not."""
+    if not LLM_ENABLED:
+        log.info("LLM disabled; tables only.")
+        return Narrative()
+
+    factsheet = build_factsheet(graph)
+    raw: dict[str, Any] = {}
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            raw = _run_crew(factsheet)
+            break
+        except Exception as exc:
+            log.warning("Narrative attempt %s failed: %s", attempt + 1, exc)
+    if not raw:
+        log.warning("Narrative unavailable; continuing with tables only.")
+        return Narrative()
+
+    narrative = _assemble_narrative(raw)
+    narrative.unverified_identifiers = _validate_narrative(narrative, graph)
+    if narrative.unverified_identifiers:
+        log.warning("Narrative names identifiers absent from the export: %s",
+                    ", ".join(narrative.unverified_identifiers))
+    return narrative
 
 
 def _run_crew(factsheet: dict[str, Any]) -> dict[str, Any]:
     llm = _build_llm()
     facts = json.dumps(factsheet, indent=1, ensure_ascii=False)
-    allowed = sorted(
-        {e["name"] for k in ("sources", "references", "transformations", "targets")
-         for e in factsheet[k]}
-        | {l["name"] for l in factsheet["links"]}
-    )
+    allowed = sorted({e["name"] for k in ("sources", "references", "transformations", "targets")
+                      for e in factsheet[k]} | {l["name"] for l in factsheet["links"]})
     allowed_block = ", ".join(allowed)
 
     architect = Agent(
         role="ETL Solution Architect",
-        goal="Explain how an ETL workflow is put together, accurately and without embellishment.",
-        backstory=(
-            "You document data integration workflows for enterprise data teams. "
-            "Your readers are engineers and analysts who need to understand a job "
-            "they did not write."
-        ),
-        llm=llm, verbose=False, allow_delegation=False,
-    )
+        goal="Explain how a workflow is put together, accurately and without embellishment.",
+        backstory="You document data integration workflows for engineers who did not "
+                  "write the job they are reading about.",
+        llm=llm, verbose=False, allow_delegation=False)
     documenter = Agent(
         role="Technical Documentation Specialist",
-        goal="Describe individual workflow stages in one or two precise sentences each.",
-        backstory=(
-            "You write reference documentation. You are concise, you never speculate "
-            "beyond the metadata you are given, and you keep every entry the same shape."
-        ),
-        llm=llm, verbose=False, allow_delegation=False,
-    )
+        goal="Describe individual stages in one or two precise sentences each.",
+        backstory="You write reference documentation. You never speculate beyond the "
+                  "metadata you are given and keep every entry the same shape.",
+        llm=llm, verbose=False, allow_delegation=False)
 
-    architecture_task = Task(
-        description=(
-            f"{GROUNDING_RULES}\n"
-            f"Permitted names: {allowed_block}\n\n"
-            f"Workflow factsheet:\n{facts}\n\n"
-            "Produce JSON with two keys.\n\n"
-            '"diagram": a plain-text arrow diagram of the workflow, laid out left to '
-            "right in execution order using only these characters: - | > + and spaces, "
-            "plus the stage names. Sources on the left, targets on the right. Show "
-            "branches on separate lines. Keep every line under 100 characters. Put the "
-            "role in square brackets under each stage name.\n\n"
-            f'"description": at most three paragraphs, {MAX_PROSE_CHARS} characters in total, '
-            "explaining the flow - where records enter, how they are combined and "
-            "transformed, where the flow branches and on what condition, and where "
-            "records end up. Separate paragraphs with a blank line."
-        ),
-        expected_output='JSON object with keys "diagram" and "description".',
-        agent=architect,
-    )
+    summary_task = Task(
+        description=(f"{GROUNDING_RULES}\nPermitted names: {allowed_block}\n\n"
+                     f"Factsheet:\n{facts}\n\n"
+                     f"Write a summary of what this workflow does, at most "
+                     f"{MAX_PROSE_CHARS} characters: where records enter, how they are "
+                     "combined and transformed, where the flow branches and on what "
+                     "condition, and where records end up.\n\n"
+                     'Return JSON: {"summary": "text"}.'),
+        expected_output='JSON with key "summary".', agent=architect)
 
-    # One call for every stage. One Task per stage would re-send the whole
-    # context for each one and turn a 40-stage job into 40 round trips.
-    entities_task = Task(
-        description=(
-            f"{GROUNDING_RULES}\n"
-            f"Permitted names: {allowed_block}\n\n"
-            f"Workflow factsheet:\n{facts}\n\n"
-            "Write one description for EVERY stage listed under sources, references, "
-            "transformations and targets. One or two sentences each and AT MOST "
-            f"{MAX_DESCRIPTION_CHARS} characters, stating what the stage does in the flow "
-            "and anything operationally significant in its properties.\n\n"
-            'Return a single JSON object mapping each stage name to its description, '
-            'for example {"STAGE_NAME": "text", "OTHER_STAGE": "text"}.'
-        ),
-        expected_output="JSON object mapping every stage name to a description.",
-        agent=documenter,
-    )
+    # One call for every stage. A Task per stage re-sends the whole context and
+    # turns a 40-stage job into 40 round trips.
+    stages_task = Task(
+        description=(f"{GROUNDING_RULES}\nPermitted names: {allowed_block}\n\n"
+                     f"Factsheet:\n{facts}\n\n"
+                     "Describe EVERY stage listed under sources, references, transformations "
+                     f"and targets. One or two sentences and at most {MAX_DESCRIPTION_CHARS} "
+                     "characters each, stating what the stage does in the flow and anything "
+                     "operationally significant in its properties.\n\n"
+                     'Return JSON mapping each stage name to its description.'),
+        expected_output="JSON mapping every stage name to a description.", agent=documenter)
 
     paths_task = Task(
-        description=(
-            f"{GROUNDING_RULES}\n"
-            f"Permitted names: {allowed_block}\n\n"
-            f"Workflow factsheet:\n{facts}\n\n"
-            "For each path listed under paths, write one or two sentences and AT MOST "
-            f"{MAX_DESCRIPTION_CHARS} characters explaining what that route represents. "
-            "Where a path begins at a reference stage, say that it represents data "
-            "influence rather than record movement. Then write a closing summary of the "
-            f"paths as a whole, at most {MAX_PROSE_CHARS} characters.\n\n"
-            'Return JSON: {"paths": {"1": "text", "2": "text"}, "summary": "text"}.'
-        ),
-        expected_output='JSON object with keys "paths" and "summary".',
-        agent=architect,
-    )
+        description=(f"{GROUNDING_RULES}\nPermitted names: {allowed_block}\n\n"
+                     f"Factsheet:\n{facts}\n\n"
+                     "For each path, write one or two sentences and at most "
+                     f"{MAX_DESCRIPTION_CHARS} characters on what that route represents. "
+                     "Where a path begins at a reference stage, say it represents data "
+                     "influence rather than record movement.\n\n"
+                     "Then list any design observations worth a reader's attention - an "
+                     "inner join that silently drops records, a flow with no connection to "
+                     "the rest of the job, an overwrite that loses history. Only what the "
+                     "factsheet supports.\n\n"
+                     'Return JSON: {"paths": {"1": "text"}, '
+                     '"findings": [{"object": "STAGE_NAME", "text": "text"}]}.'),
+        expected_output='JSON with keys "paths" and "findings".', agent=architect)
 
-    crew = Crew(
-        agents=[architect, documenter],
-        tasks=[architecture_task, entities_task, paths_task],
-        process=Process.sequential,
-        verbose=False,
-    )
+    crew = Crew(agents=[architect, documenter],
+                tasks=[summary_task, stages_task, paths_task],
+                process=Process.sequential, verbose=False)
     crew.kickoff()
 
-    return {
-        "architecture": _json_from_task(architecture_task),
-        "entities": _json_from_task(entities_task),
-        "paths": _json_from_task(paths_task),
-    }
+    return {"summary": _json_from_task(summary_task),
+            "stages": _json_from_task(stages_task),
+            "paths": _json_from_task(paths_task)}
 
 
 def _task_text(task) -> str:
-    """CrewAI has moved this around between versions; try the known shapes."""
+    """CrewAI has moved this between versions; try the known shapes."""
     out = getattr(task, "output", None)
     if out is None:
         return ""
     for attr in ("raw", "raw_output", "exported_output", "result"):
-        val = getattr(out, attr, None)
-        if isinstance(val, str) and val.strip():
-            return val
+        value = getattr(out, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
     return str(out)
 
 
@@ -1423,83 +1225,74 @@ def _json_from_task(task) -> dict[str, Any]:
 
 
 def _loads_loose(text: str) -> dict[str, Any]:
-    """Parse JSON out of a model response that may carry fences or commentary."""
     if not text:
         return {}
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
-    try:
-        val = json.loads(text)
-        return val if isinstance(val, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.M).strip()
+    for candidate in (text, text[text.find("{"): text.rfind("}") + 1] if "{" in text else ""):
         try:
-            val = json.loads(text[start : end + 1])
-            return val if isinstance(val, dict) else {}
-        except json.JSONDecodeError:
-            pass
+            value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
+        except (json.JSONDecodeError, ValueError):
+            continue
     return {}
 
 
-def _assemble_narrative(raw: dict[str, Any], graph: WorkflowGraph) -> Narrative:
-    arch = raw.get("architecture", {}) or {}
-    ents = raw.get("entities", {}) or {}
-    paths = raw.get("paths", {}) or {}
-
-    diagram = str(arch.get("diagram", "") or "").strip("\n")
-    if not _diagram_is_usable(diagram, graph):
-        log.info("Model diagram unusable; falling back to the derived layout.")
-        diagram = build_arrow_diagram(graph)
-
-    path_texts: dict[int, str] = {}
-    for key, val in (paths.get("paths") or {}).items():
+def _assemble_narrative(raw: dict[str, Any]) -> Narrative:
+    paths_block = raw.get("paths", {}) or {}
+    explanations: dict[int, str] = {}
+    for key, value in (paths_block.get("paths") or {}).items():
         try:
-            path_texts[int(key)] = str(val).strip()
+            explanations[int(key)] = clean_text(value, markdown=True)
         except (TypeError, ValueError):
             continue
 
+    findings = []
+    for item in paths_block.get("findings") or []:
+        if isinstance(item, dict) and item.get("text"):
+            findings.append((clean_text(item.get("object", ""), markdown=True),
+                             clean_text(item["text"], markdown=True)))
+
     return Narrative(
-        architecture_diagram=diagram,
-        architecture_description=str(arch.get("description", "") or "").strip(),
-        entity_descriptions={
-            str(k): str(v).strip() for k, v in ents.items() if str(v).strip()
-        },
-        path_explanations=path_texts,
-        path_summary=str(paths.get("summary", "") or "").strip(),
+        summary=str((raw.get("summary", {}) or {}).get("summary", "") or ""),
+        stage_descriptions={str(k): clean_text(v, markdown=True)
+                            for k, v in (raw.get("stages", {}) or {}).items()
+                            if str(v).strip()},
+        path_explanations=explanations,
+        design_findings=findings,
     )
 
 
-def _diagram_is_usable(diagram: str, graph: WorkflowGraph) -> bool:
-    """
-    A model-drawn diagram is accepted only if it is actually about this workflow:
-    it must mention most of the stages and stay within a printable width.
-    """
-    if fit_diagram(diagram) is None:                 # width-checked again at build time
-        return False
-    named = [s.display_name for s in graph.stages if s.name]
-    if not named:
-        return False
-    present = sum(1 for n in named if n in diagram)
-    return present >= max(1, int(len(named) * 0.75))
+def _validate_narrative(narrative: Narrative, graph: WorkflowGraph) -> list[str]:
+    """A model asked to describe an ETL job will produce plausible table and
+    column names. Anything unrecognised is reported rather than shipped."""
+    known = {k.upper() for k in known_identifiers(graph)}
+    corpus = " ".join([narrative.summary]
+                      + list(narrative.stage_descriptions.values())
+                      + list(narrative.path_explanations.values())
+                      + [t for _, t in narrative.design_findings])
+    candidates = set(re.findall(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b", corpus))
+    return sorted(c for c in candidates if not any(c.upper() in k for k in known))
 
 
-BOX_TL, BOX_TR, BOX_BL, BOX_BR = "\u250c", "\u2510", "\u2514", "\u2518"
-BOX_H, BOX_V, BOX_STEM = "\u2500", "\u2502", "\u252c"
-TEE, ELBOW, ARROW_D, ARROW_R = "\u251c", "\u2514", "\u25bc", "\u25b6"
+# =============================================================================
+# SECTION E   RENDERING
+# =============================================================================
+# HTML and CSS rather than Word, so the printed layout is the same everywhere.
+
+_GLYPHS = {
+    "box": dict(tl="┌", tr="┐", bl="└", br="┘", h="─", v="│",
+                stem="┬", tee="├", elbow="└", down="▼", right="▶"),
+    "ascii": dict(tl="+", tr="+", bl="+", br="+", h="-", v="|",
+                  stem="+", tee="+", elbow="+", down="v", right=">"),
+}
 
 
-def build_flowchart(graph: WorkflowGraph, width_in: float | None = None) -> str:
-    """A top-to-bottom flowchart: a box per stage, arrows for links.
+def _ellipsize(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + TRUNCATION_MARK
 
-    Vertical rather than left to right because a portrait page is only about a
-    hundred characters wide, which a six-deep chain of connector names overruns.
-    """
-    stages = [s for s in graph.stages if s.role != ROLE_UNCLASSIFIED]
-    if not stages or not graph.links or len(stages) > MAX_STAGES_FOR_DIAGRAM:
-        return ""
 
+def _stage_depths(graph: WorkflowGraph) -> dict[str, int]:
     depth: dict[str, int] = {}
 
     def compute(sid: str, seen: frozenset[str]) -> int:
@@ -1510,1073 +1303,642 @@ def build_flowchart(graph: WorkflowGraph, width_in: float | None = None) -> str:
         depth[sid] = 0 if not prior else 1 + max(compute(p, seen | {sid}) for p in prior)
         return depth[sid]
 
-    for stage in stages:
+    for stage in graph.stages:
         compute(stage.identifier, frozenset())
+    return depth
 
-    order = sorted(stages, key=lambda s: (depth[s.identifier], s.display_name))
+
+def build_flowchart(graph: WorkflowGraph, only: Sequence[Stage] | None = None) -> str:
+    """Top to bottom: a box per stage, arrows for links.
+
+    Vertical rather than left to right because a portrait page is about eighty
+    characters wide, which a chain of connector-length names overruns.
+    """
+    stages = [s for s in (only if only is not None else graph.stages)
+              if s.role != ROLE_UNCLASSIFIED]
+    if not stages or not graph.links or len(stages) > MAX_STAGES_FOR_DIAGRAM:
+        return ""
+
+    depth = _stage_depths(graph)
+    order = sorted(stages, key=lambda s: (depth.get(s.identifier, 0), s.display_name))
+    shown = {s.identifier for s in order}
     position = {s.identifier: i for i, s in enumerate(order)}
-    names = {s.identifier: s.display_name for s in graph.stages}
 
-    budget = int(72 * ((width_in or CONTENT_WIDTH_IN) - 0.25)
-                 / (MONO_CHAR_WIDTH_RATIO * SIZE_DIAGRAM))
-    inner = min(max(len(s.display_name) for s in order) + 2, max(24, budget - 24))
-    stem = 4                                    # indent of the connector stem
-
+    g = _GLYPHS.get(DIAGRAM_STYLE, _GLYPHS["box"])
+    inner = min(max(len(s.display_name) for s in order) + 2, MAX_DIAGRAM_LINE_CHARS - 26)
+    stem = 4
     lines: list[str] = []
-    for index, stage in enumerate(order):
-        role = ROLE_LABELS[stage.role].lower()
-        label = _ellipsize(stage.display_name, inner - 2)
-        lines.append(f"{BOX_TL}{BOX_H * inner}{BOX_TR}")
-        lines.append(f"{BOX_V} {label:<{inner - 2}} {BOX_V}  {role}")
 
-        outgoing = [l for l in graph.links if l.from_stage == stage.identifier]
+    for index, stage in enumerate(order):
+        label = _ellipsize(stage.display_name, inner - 2)
+        lines.append(f"{g['tl']}{g['h'] * inner}{g['tr']}")
+        lines.append(f"{g['v']} {label:<{inner - 2}} {g['v']}  {ROLE_LABELS[stage.role].lower()}")
+
+        outgoing = [l for l in graph.outgoing(stage) if l.to_stage in shown]
         if not outgoing:
-            lines.append(f"{BOX_BL}{BOX_H * inner}{BOX_BR}")
+            lines.append(f"{g['bl']}{g['h'] * inner}{g['br']}")
             lines.append("")
             continue
 
-        lines.append(f"{BOX_BL}{BOX_H * stem}{BOX_STEM}{BOX_H * (inner - stem - 1)}{BOX_BR}")
-
-        straight = (
-            len(outgoing) == 1
-            and position.get(outgoing[0].to_stage) == index + 1
-        )
-        if straight:
-            link = outgoing[0]
-            lines.append(f"{' ' * stem}{BOX_V}  {link.display_name}")
-            lines.append(f"{' ' * stem}{ARROW_D}")
+        lines.append(f"{g['bl']}{g['h'] * stem}{g['stem']}{g['h'] * (inner - stem - 1)}{g['br']}")
+        if len(outgoing) == 1 and position.get(outgoing[0].to_stage) == index + 1:
+            lines.append(f"{' ' * stem}{g['v']}  {outgoing[0].display_name}")
+            lines.append(f"{' ' * stem}{g['down']}")
         else:
-            target_w = max(len(names.get(l.to_stage, l.to_stage)) for l in outgoing)
+            width = max(len(graph.name_of(l.to_stage)) for l in outgoing)
             for i, link in enumerate(outgoing):
-                joint = ELBOW if i == len(outgoing) - 1 else TEE
-                tail = " (reference)" if link.is_reference else ""
-                target = names.get(link.to_stage, link.to_stage)
-                lines.append(
-                    f"{' ' * stem}{joint}{BOX_H}{ARROW_R} {target:<{target_w}}"
-                    f"   {link.display_name}{tail}"
-                )
+                joint = g["elbow"] if i == len(outgoing) - 1 else g["tee"]
+                tail = "  (reference)" if link.is_reference else ""
+                lines.append(f"{' ' * stem}{joint}{g['h']}{g['right']} "
+                             f"{graph.name_of(link.to_stage):<{width}}   "
+                             f"{link.display_name}{tail}")
             lines.append("")
 
     while lines and not lines[-1]:
         lines.pop()
-    if max(len(l) for l in lines) > budget:
-        return ""
     return "\n".join(lines)
 
 
-def build_arrow_diagram(graph: WorkflowGraph, width_in: float | None = None) -> str:
-    """A flowchart where one fits, otherwise a line per link."""
-    chart = build_flowchart(graph, width_in)
-    if chart:
-        return chart
-
-    if not graph.links or len(graph.stages) > MAX_STAGES_FOR_DIAGRAM:
-        return ""
-    rows = [(_name_of(graph, l.from_stage), _name_of(graph, l.to_stage), l.is_reference)
-            for l in graph.links]
-    marker, arrow = "  (reference)", "  -->  "
-    budget = int(72 * ((width_in or CONTENT_WIDTH_IN) - 0.25)
-                 / (MONO_CHAR_WIDTH_RATIO * DIAGRAM_MIN_FONT))
-    name_w = max(len(a) for a, _, _ in rows)
-    longest = max(name_w + len(arrow) + len(b) + (len(marker) if r else 0) for _, b, r in rows)
-    allowed = budget - len(arrow) - len(marker)
-    if longest > budget and allowed >= 16:
-        limit = max(8, allowed // 2)
-        rows = [(_ellipsize(a, limit), _ellipsize(b, limit), r) for a, b, r in rows]
-        name_w = max(len(a) for a, _, _ in rows)
-    return "\n".join(f"{a:<{name_w}}{arrow}{b}{marker if r else ''}" for a, b, r in rows)
+def build_main_chain(graph: WorkflowGraph) -> list[Stage]:
+    """The longest source-to-target route, for the orientation diagram."""
+    if not graph.paths:
+        return []
+    longest = max(graph.paths, key=len)[:GLANCE_DIAGRAM_STAGES]
+    by_name = {s.display_name: s for s in graph.stages}
+    return [by_name[n] for n in longest if n in by_name]
 
 
-def _ellipsize(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
-
-
-def _validate_narrative(narrative: Narrative, graph: WorkflowGraph) -> list[str]:
-    """
-    Identifier-shaped tokens in the prose must exist in the export.
-
-    A model asked to describe an ETL job will produce plausible table and column
-    names. In a document that reads as authoritative, that is the failure mode
-    worth catching, so anything unrecognised is reported rather than shipped
-    silently.
-    """
-    known_upper = {k.upper() for k in known_identifiers(graph)}
-    corpus = " ".join(
-        [narrative.architecture_description, narrative.path_summary]
-        + list(narrative.entity_descriptions.values())
-        + list(narrative.path_explanations.values())
-    )
-    candidates = set(re.findall(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b", corpus))
-    return sorted(c for c in candidates if c.upper() not in known_upper)
-
-
-# =============================================================================
-# SECTION E   WORD DOCUMENT BUILDER
-# =============================================================================
-# temp.docx is a plain Word document. Everything below overrides its defaults so
-# the output matches the approved draft rather than Word's built-in styling.
-
-# --- Content normalisation ---------------------------------------------------
-# The model writes markdown, runs long, and wraps lines. Everything reaching the
-# page goes through these first.
-
-# Underscore markdown is deliberately NOT handled. DataStage technical names are
-# full of underscores, and treating them as emphasis markers silently rewrites
-# EDW_STG.CUSTOMER into EDWSTG.CUSTOMER - corrupting the one thing in the report
-# that must be exact. Asterisk markdown only.
-_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
-_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s|\*)(.+?)(?<!\s)\*(?!\*)", re.S)
-_MD_CODE_RE = re.compile(r"`{1,3}([^`]*)`{1,3}", re.S)
-_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
-_MD_BULLET_RE = re.compile(r"^\s*[-*+]\s+", re.M)
-_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
-ZERO_WIDTH_SPACE = "\u200b"
-
-
-def clean_text(text: Any, markdown: bool = False) -> str:
-    """Normalise whitespace and flatten to a single line.
-
-    Markdown is stripped only from model-written text. Doing it everywhere ate
-    the leading # of labels such as "# of sources", which are report headings,
-    not markdown.
-    """
-    if text is None:
-        return ""
-    out = str(text)
-    if markdown:
-        out = _MD_HEADING_RE.sub("", out)
-        out = _MD_BULLET_RE.sub("", out)
-        out = _MD_CODE_RE.sub(r"\1", out)
-        out = _MD_BOLD_RE.sub(r"\1", out)
-        out = _MD_ITALIC_RE.sub(r"\1", out)
-    out = out.replace("\u00a0", " ")
-    # Joining lines needs punctuation, otherwise former bullet points run
-    # together into one unreadable sentence.
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
-    joined = []
-    for i, line in enumerate(lines):
-        if i < len(lines) - 1 and not line.endswith((".", "!", "?", ":", ";", ",")):
-            line += "."
-        joined.append(line)
-    return re.sub(r"\s+", " ", " ".join(joined)).strip()
-
-
-def truncate_at_sentence(text: str, limit: int) -> str:
-    """Trim to `limit`, preferring the last sentence end so the cell still reads
-    as a finished thought rather than a cut-off clause."""
-    if not text or len(text) <= limit:
-        return text
-    window = text[: limit + 1]
-    ends = [m.end() for m in _SENTENCE_END_RE.finditer(window)]
-    if ends and ends[-1] >= limit * 0.55:
-        return window[: ends[-1]].strip()
-    cut = window.rsplit(" ", 1)[0].rstrip(" ,;:-")
-    return f"{cut}{TRUNCATION_MARK}"
-
-
-# Word may break after these. It will not break mid-word, which is what makes a
-# long name overflow its column.
-_TOKEN_SEPARATORS = "_.:/\\-|,"
-
-
-def soften_long_tokens(text: str, after: int = LONG_TOKEN_BREAK_AFTER) -> str:
-    """Let Word wrap long identifiers at their own separators.
-
-    EDW_STG.CUSTOMER_DELTA gets break points after each _ and . so it wraps as
-    whole words. Only a run with no separator at all is split by length, and
-    only once it is longer than any column could show.
-    """
+def _cell(value: Any, limit: int | None = None, markdown: bool = False) -> dict[str, Any]:
+    """A table cell: text plus whether it is a missing-value placeholder."""
+    if value is None or value == "":
+        return {"text": TEXT_NOT_IDENTIFIED, "missing": True}
+    text = clean_text(value, markdown=markdown)
     if not text:
-        return ""
-
-    def soften(match: re.Match) -> str:
-        token = match.group(0)
-        if len(token) <= 8:
-            return token
-        out: list[str] = []
-        run = ""
-        for ch in token:
-            run += ch
-            if ch in _TOKEN_SEPARATORS:
-                out.append(run + ZERO_WIDTH_SPACE)
-                run = ""
-            elif len(run) >= after:
-                out.append(run + ZERO_WIDTH_SPACE)
-                run = ""
-        out.append(run)
-        return "".join(out).rstrip(ZERO_WIDTH_SPACE)
-
-    return re.sub(r"\S+", soften, text)
+        return {"text": TEXT_NOT_IDENTIFIED, "missing": True}
+    if limit:
+        text = truncate_at_sentence(text, limit)
+    return {"text": text, "missing": False}
 
 
-def limit_prose(text: str) -> list[str]:
-    """Split narrative into paragraphs and cap both count and total length, so
-    a talkative model cannot push the next section onto another page."""
+def build_context(graph: WorkflowGraph, narrative: Narrative) -> dict[str, Any]:
+    """Everything the template needs. All formatting decisions live here."""
+    from datetime import datetime
+
+    def described(stage: Stage) -> dict[str, Any]:
+        return _cell(narrative.stage_descriptions.get(stage.display_name), MAX_DESCRIPTION_CHARS)
+
+    def stage_row(s: Stage) -> dict[str, Any]:
+        return {"id": s.identifier,
+                "name": _cell(s.name),
+                "type": s.display_type,
+                "object": _cell(stage_object(s) if s.role in
+                                (ROLE_SOURCE, ROLE_REFERENCE, ROLE_TARGET) else TEXT_NOT_APPLICABLE),
+                "inputs": len(s.inputs), "outputs": len(s.outputs)}
+
+    groups = [("Sources", graph.sources), ("References", graph.references),
+              ("Transformations", graph.transformations), ("Targets", graph.targets),
+              ("Unclassified", graph.data_objects)]
+
+    detail = []
+    for stage in graph.transformations + graph.sources + graph.references + graph.targets:
+        props = {k: v for k, v in _interesting_properties(stage, limit=6).items()
+                 if k != "StageType"}
+        description = described(stage)
+        if not props and description["missing"]:
+            continue
+        detail.append({"name": stage.display_name, "type": stage.display_type,
+                       "id": stage.identifier, "role": ROLE_LABELS[stage.role],
+                       "properties": props, "description": description})
+
+    findings = [{"ref": f.ref, "category": f.category, "obj": _cell(f.obj), "text": f.text}
+                for f in graph.findings]
+    for obj, text in narrative.design_findings:
+        findings.insert(0, {"ref": "", "category": "Design",
+                            "obj": _cell(obj or TEXT_NOT_APPLICABLE),
+                            "text": truncate_at_sentence(text, MAX_DESCRIPTION_CHARS)})
+    for ident in narrative.unverified_identifiers:
+        findings.append({"ref": "", "category": "Unverified reference",
+                         "obj": _cell(ident),
+                         "text": f"The descriptive text names {ident}, which does not appear "
+                                 "in the export and could not be verified."})
+    for i, item in enumerate(findings, start=1):
+        item["ref"] = f"F-{i:02d}"
+
+    return {
+        "title": REPORT_TITLE,
+        "subtitle": REPORT_SUBTITLE,
+        "job_name": graph.job.job_name,
+        "source_file": graph.job.source_file,
+        "generated": datetime.now().strftime("%d %B %Y"),
+        "text_not_identified": TEXT_NOT_IDENTIFIED,
+        "mark_generated": MARK_GENERATED_PROSE,
+        "summary": limit_prose(narrative.summary),
+        "basis": _basis_paragraphs(graph, narrative),
+        "facts": [
+            ("Stages", len(graph.stages)), ("Links", len(graph.links)),
+            ("Sources", len(graph.sources)), ("References", len(graph.references)),
+            ("Transformations", len(graph.transformations)), ("Targets", len(graph.targets)),
+            ("Paths", graph.total_path_count), ("Findings", len(findings)),
+        ],
+        "glance_chart": build_flowchart(graph, build_main_chain(graph)),
+        "full_chart": build_flowchart(graph),
+        "groups": [(label, [stage_row(s) for s in members])
+                   for label, members in groups if members],
+        "links": [{"name": l.display_name, "from": graph.name_of(l.from_stage),
+                   "to": graph.name_of(l.to_stage), "kind": l.kind,
+                   "columns": l.column_count if l.column_count is not None else "—"}
+                  for l in graph.links],
+        "detail": detail,
+        "paths": [{"index": i, "route": " → ".join(p), "length": len(p),
+                   "explanation": _cell(narrative.path_explanations.get(i),
+                                        MAX_DESCRIPTION_CHARS)}
+                  for i, p in enumerate(graph.paths, start=1)],
+        "findings": findings,
+        "sections": _present_sections(graph, narrative, detail, findings),
+    }
+
+
+def _present_sections(graph, narrative, detail, findings) -> list[str]:
+    """A section with no rows is left out and the rest renumber."""
+    candidates = [
+        ("At a Glance", True),
+        ("Stage Inventory", bool(graph.stages)),
+        ("Links", bool(graph.links)),
+        ("Stage Detail", bool(detail)),
+        ("Data Paths", bool(graph.paths)),
+        ("Findings", bool(findings)),
+    ]
+    return [n for n, present in candidates if present or not SKIP_EMPTY_SECTIONS]
+
+
+def _basis_paragraphs(graph: WorkflowGraph, narrative: Narrative) -> list[str]:
+    """What the parser could and could not determine. Silent omission is the
+    failure mode this exists to prevent."""
+    out = [
+        f"All {len(graph.stages)} stages and {len(graph.links)} links in this export were "
+        f"resolved, and {len(graph.stages) - len(graph.data_objects)} of them were classified "
+        "by role. "
+        + ("Path enumeration completed within its limits and found no cyclic routes."
+           if not (graph.paths_truncated or graph.has_cycles)
+           else f"Path enumeration reported {graph.total_path_count} paths in total.")
+    ]
+    gaps = []
+    if graph.job.warnings:
+        gaps.append(f"{len(graph.job.warnings)} link(s) name a partner outside this job, "
+                    "which indicates a shared container; those are excluded from the "
+                    "flowchart and from path enumeration")
+    missing = [s for s in graph.sources + graph.targets if not stage_object(s)]
+    if missing:
+        gaps.append(f"{len(missing)} source or target record no table or file name in this "
+                    "export, so their Object entries read as not identified")
+    if graph.job.inferred_types:
+        gaps.append("record types "
+                    + ", ".join(sorted(graph.job.inferred_types))
+                    + " were not previously known but carry stage properties, so they are "
+                      "documented as stages")
+    if gaps:
+        out.append("Not everything could be determined: " + "; ".join(gaps) + ".")
+
+    if narrative.stage_descriptions or narrative.summary:
+        out.append("Descriptive text is generated and marked with a rule. Every table value "
+                   "is read directly from the export.")
+    else:
+        out.append("Descriptive text was not generated for this report, so descriptions read "
+                   "as not identified. Every table value is read directly from the export.")
+    return out
+
+
+PAGE_SIZES = {"A4": A4, "LETTER": LETTER}
+
+
+def _hex(value: str):
+    return colors.HexColor(value)
+
+
+def _styles() -> dict[str, ParagraphStyle]:
+    """Paragraph styles built from the tunables in Section A."""
+    base = ParagraphStyle("body", fontName=FONT_SERIF, fontSize=SIZE_BODY,
+                          leading=SIZE_BODY * 1.5, textColor=_hex(COLOR_INK),
+                          alignment=TA_JUSTIFY, spaceAfter=4)
+    return {
+        "body": base,
+        "eyebrow": ParagraphStyle("eyebrow", fontName=FONT_MONO_BOLD,
+                                  fontSize=SIZE_SECTION_NUMBER,
+                                  leading=SIZE_SECTION_NUMBER * 1.4,
+                                  textColor=_hex(COLOR_CORAL_DEEP), spaceAfter=2),
+        "title": ParagraphStyle("title", fontName=FONT_SANS_BOLD,
+                                fontSize=SIZE_SECTION_TITLE,
+                                leading=SIZE_SECTION_TITLE * 1.2,
+                                textColor=_hex(COLOR_CORAL), spaceAfter=3),
+        "sub": ParagraphStyle("sub", fontName=FONT_MONO_BOLD,
+                              fontSize=SIZE_SECTION_NUMBER,
+                              leading=SIZE_SECTION_NUMBER * 1.5,
+                              textColor=_hex(COLOR_CORAL_DEEP),
+                              spaceBefore=8, spaceAfter=3),
+        "cell": ParagraphStyle("cell", fontName=FONT_SERIF, fontSize=SIZE_TABLE,
+                               leading=SIZE_TABLE * 1.35, textColor=_hex(COLOR_INK)),
+        "cell_right": ParagraphStyle("cell_right", fontName=FONT_MONO,
+                                     fontSize=SIZE_TABLE_HEAD,
+                                     leading=SIZE_TABLE_HEAD * 1.45, alignment=2,
+                                     textColor=_hex(COLOR_INK)),
+        "head_right": ParagraphStyle("head_right", fontName=FONT_MONO_BOLD,
+                                     fontSize=SIZE_TABLE_HEAD,
+                                     leading=SIZE_TABLE_HEAD * 1.3, alignment=2,
+                                     textColor=_hex(COLOR_INK_DIM)),
+        "cell_mono": ParagraphStyle("cell_mono", fontName=FONT_MONO,
+                                    fontSize=SIZE_TABLE_HEAD,
+                                    leading=SIZE_TABLE_HEAD * 1.45,
+                                    textColor=_hex(COLOR_INK)),
+        "cell_missing": ParagraphStyle("cell_missing", fontName=FONT_SERIF_ITALIC,
+                                       fontSize=SIZE_TABLE, leading=SIZE_TABLE * 1.35,
+                                       textColor=_hex(COLOR_INK_FAINT)),
+        "head": ParagraphStyle("head", fontName=FONT_MONO_BOLD, fontSize=SIZE_TABLE_HEAD,
+                               leading=SIZE_TABLE_HEAD * 1.3,
+                               textColor=_hex(COLOR_INK_DIM)),
+        "band": ParagraphStyle("band", fontName=FONT_MONO_BOLD, fontSize=SIZE_TABLE_HEAD,
+                               leading=SIZE_TABLE_HEAD * 1.3,
+                               textColor=_hex(COLOR_INK_DIM)),
+        "caption": ParagraphStyle("caption", fontName=FONT_MONO_BOLD, fontSize=SIZE_CAPTION,
+                                  leading=SIZE_CAPTION * 1.4,
+                                  textColor=_hex(COLOR_CORAL_DEEP), spaceBefore=3,
+                                  spaceAfter=10),
+        "panel": ParagraphStyle("panel", parent=base, fontSize=SIZE_TABLE,
+                                leading=SIZE_TABLE * 1.5, spaceAfter=4),
+        "toc_num": ParagraphStyle("toc_num", fontName=FONT_MONO_BOLD, fontSize=SIZE_CAPTION,
+                                  leading=SIZE_BODY * 1.4,
+                                  textColor=_hex(COLOR_CORAL_DEEP)),
+        "toc_name": ParagraphStyle("toc_name", fontName=FONT_SERIF, fontSize=SIZE_BODY,
+                                   leading=SIZE_BODY * 1.4, textColor=_hex(COLOR_INK)),
+        "cover_title": ParagraphStyle("cover_title", fontName=FONT_SANS_BOLD, fontSize=22,
+                                      leading=26, alignment=1, textColor=_hex(COLOR_INK)),
+        "cover_sub": ParagraphStyle("cover_sub", fontName=FONT_SERIF, fontSize=11,
+                                    leading=15, alignment=1,
+                                    textColor=_hex(COLOR_INK_DIM), spaceBefore=6),
+        "cover_field": ParagraphStyle("cover_field", fontName=FONT_MONO, fontSize=SIZE_BODY,
+                                      leading=SIZE_BODY * 2, alignment=1,
+                                      textColor=_hex(COLOR_INK_DIM)),
+        "fact_label": ParagraphStyle("fact_label", fontName=FONT_MONO, fontSize=SIZE_CAPTION,
+                                     leading=SIZE_CAPTION * 1.4,
+                                     textColor=_hex(COLOR_INK_FAINT)),
+        "fact_value": ParagraphStyle("fact_value", fontName=FONT_SANS_BOLD, fontSize=13,
+                                     leading=15, textColor=_hex(COLOR_INK)),
+        "figcap": ParagraphStyle("figcap", fontName=FONT_MONO_BOLD, fontSize=SIZE_CAPTION,
+                                 leading=SIZE_CAPTION * 1.4,
+                                 textColor=_hex(COLOR_CORAL_DEEP), spaceBefore=3,
+                                 spaceAfter=10),
+        "chart": ParagraphStyle("chart", fontName=FONT_MONO, fontSize=SIZE_DIAGRAM,
+                                leading=SIZE_DIAGRAM * 1.35, textColor=_hex(COLOR_INK)),
+    }
+
+
+def _label(text: str) -> str:
+    """Small uppercase label. ReportLab has no letter-spacing, so the design's
+    tracking is dropped rather than faked by inserting spaces between letters -
+    that ran the words together."""
+    return _escape(text).upper()
+
+
+class _NumberedCanvas(Canvas):
+    """Two passes, so the footer can say 'Page 3 of 9'."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved = []
+
+    def showPage(self):
+        self._saved.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._saved)
+        for state in self._saved:
+            self.__dict__.update(state)
+            if self._pageNumber > 1:                 # the cover carries nothing
+                self._draw_furniture(total)
+            super().showPage()
+        super().save()
+
+    def _draw_furniture(self, total: int) -> None:
+        width, height = self._pagesize
+        side = MARGIN_SIDE_MM * mm
+        top = height - MARGIN_TOP_MM * mm
+        bottom = MARGIN_BOTTOM_MM * mm
+
+        self.setFont(FONT_MONO, SIZE_RUNNING)
+        self.setFillColor(_hex(COLOR_INK_FAINT))
+        self.drawString(side, top + 5 * mm, self._header_left)
+        self.drawRightString(width - side, top + 5 * mm, self._header_right)
+        self.setStrokeColor(_hex(COLOR_RULE))
+        self.setLineWidth(0.4)
+        self.line(side, top + 3.6 * mm, width - side, top + 3.6 * mm)
+
+        self.line(side, bottom - 4 * mm, width - side, bottom - 4 * mm)
+        self.drawString(side, bottom - 7.5 * mm, self._footer_left)
+        self.drawRightString(width - side, bottom - 7.5 * mm,
+                             f"Page {self._pageNumber} of {total}")
+
+
+def _rule(width: float, colour: str, thickness: float = 0.7) -> Table:
+    """A horizontal line as a flowable."""
+    t = Table([[""]], colWidths=[width], rowHeights=[0.1])
+    t.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), thickness, _hex(colour)),
+                           ("TOPPADDING", (0, 0), (-1, -1), 0),
+                           ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+    return t
+
+
+def _section_heading(number: int | None, name: str, st, width: float) -> list:
+    label = f"Section {number}" if number else "Table of"
+    return [KeepTogether([
+        Paragraph(_label(label), st["eyebrow"]),
+        Paragraph(name, st["title"]),
+        _rule(width, COLOR_CORAL_LINE, 0.7),
+        Spacer(1, 7),
+    ])]
+
+
+def _generated(paragraphs: Sequence[str], st, width: float) -> list:
+    """Model-written text carries a rule; parsed values never do."""
+    if not paragraphs:
+        return []
+    body = [Paragraph(p, st["body"]) for p in paragraphs]
+    if not MARK_GENERATED_PROSE:
+        return body + [Spacer(1, 4)]
+    t = Table([[body]], colWidths=[width])
+    t.setStyle(TableStyle([
+        ("LINEBEFORE", (0, 0), (0, -1), 1.2, _hex(COLOR_CORAL_LINE)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return [t, Spacer(1, 8)]
+
+
+def _panel(paragraphs: Sequence[str], st, width: float) -> list:
+    inner = [Paragraph(p, st["panel"]) for p in paragraphs]
+    t = Table([[inner]], colWidths=[width])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), _hex(COLOR_PANEL_BG)),
+        ("BOX", (0, 0), (-1, -1), 0.6, _hex(COLOR_PANEL_LINE)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return [t]
+
+
+def _chart_block(text: str, st, width: float, caption: str) -> list:
     if not text:
         return []
-    blocks = [clean_text(b, markdown=True) for b in re.split(r"\n\s*\n|\n", str(text)) if b.strip()]
-    blocks = [b for b in blocks if b][:MAX_PROSE_PARAGRAPHS]
-    kept: list[str] = []
-    budget = MAX_PROSE_CHARS
-    for block in blocks:
-        if budget <= 0:
-            break
-        kept.append(truncate_at_sentence(block, budget) if len(block) > budget else block)
-        budget -= len(kept[-1])
-    return kept
+    body = Preformatted(text, st["chart"])
+    t = Table([[body]], colWidths=[width])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), _hex(COLOR_KEY_BG)),
+        ("BOX", (0, 0), (-1, -1), 0.6, _hex(COLOR_RULE)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return [t, Paragraph(_label(caption), st["figcap"])]
 
 
-def fit_diagram(text: str, usable_width_in: float | None = None) -> tuple[str, float] | None:
-    """Return the diagram and the font size it fits at, or None if it cannot fit.
-
-    Shrinking is preferred to wrapping: a wrapped monospace diagram is not a
-    smaller diagram, it is an unreadable one.
-    """
-    if not text:
-        return None
-    lines = [l.rstrip() for l in text.replace("\t", "    ").split("\n")]
-    while lines and not lines[-1]:
-        lines.pop()
-    if not lines or len(lines) > MAX_DIAGRAM_LINES:
-        return None
-
-    usable_in = (usable_width_in or CONTENT_WIDTH_IN) - 0.25   # cell padding and borders
-    longest = max(len(l) for l in lines)
-    size = SIZE_DIAGRAM
-    while size >= DIAGRAM_MIN_FONT:
-        fits = int(72 * usable_in / (MONO_CHAR_WIDTH_RATIO * size))
-        if longest <= fits:
-            return "\n".join(lines), size
-        size -= 0.5
-    return None
+def _cell_para(value: Any, st, mono: bool = False, right: bool = False):
+    """A table cell. Missing values are italic and faint."""
+    if isinstance(value, dict):
+        text, missing = value["text"], value["missing"]
+    else:
+        text, missing = str(value), False
+    if missing:
+        style = st["cell_missing"]
+    elif right:
+        style = st["cell_right"]
+    else:
+        style = st["cell_mono"] if mono else st["cell"]
+    return Paragraph(_escape(text), style)
 
 
-def _rgb(hex_color: str) -> RGBColor:
-    return RGBColor.from_string(hex_color.upper().lstrip("#"))
+def _escape(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _set_run(
-    run,
-    font: str | None = None,
-    size: float | None = None,
-    bold: bool | None = None,
-    italic: bool | None = None,
-    color: str | None = None,
-    caps: bool = False,
-    spacing_twips: int | None = None,
-) -> None:
-    """Set a run's formatting explicitly, including the east-asian and complex
-    script slots - setting only run.font.name lets Word substitute silently."""
-    if font:
-        run.font.name = font
-        rpr = run._element.get_or_add_rPr()
-        rfonts = rpr.find(qn("w:rFonts"))
-        if rfonts is None:
-            rfonts = OxmlElement("w:rFonts")
-            rpr.append(rfonts)
-        for slot in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
-            rfonts.set(qn(slot), font)
-    if size is not None:
-        run.font.size = Pt(size)
-    if bold is not None:
-        run.font.bold = bold
-    if italic is not None:
-        run.font.italic = italic
-    if color:
-        run.font.color.rgb = _rgb(color)
-    if caps:
-        rpr = run._element.get_or_add_rPr()
-        el = OxmlElement("w:caps")
-        el.set(qn("w:val"), "1")
-        rpr.append(el)
-    if spacing_twips:
-        rpr = run._element.get_or_add_rPr()
-        el = OxmlElement("w:spacing")
-        el.set(qn("w:val"), str(spacing_twips))
-        rpr.append(el)
+def _data_table(headers: Sequence[str], rows: Sequence[Sequence[Any]],
+                widths: Sequence[float], st, mono: Sequence[int] = (),
+                right: Sequence[int] = (), bands: dict[int, str] | None = None) -> Table:
+    """Header repeats across pages; column widths are fixed in points."""
+    mono, right = set(mono), set(right)
+    bands = bands or {}
+    data = [[Paragraph(_label(h), st["head_right"] if i in right else st["head"])
+             for i, h in enumerate(headers)]]
+    for row in rows:
+        data.append([_cell_para(v, st, mono=i in mono, right=i in right)
+                     for i, v in enumerate(row)])
+
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), _hex(COLOR_HEAD_BG)),
+        ("BOX", (0, 0), (-1, 0), 0.6, _hex(COLOR_RULE)),
+        ("INNERGRID", (0, 0), (-1, 0), 0.6, _hex(COLOR_RULE)),
+        ("GRID", (0, 1), (-1, -1), 0.6, _hex(COLOR_RULE_SOFT)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    for row_index, label in bands.items():
+        data[row_index] = [Paragraph(_label(label), st["band"])] + [""] * (len(headers) - 1)
+        style += [("SPAN", (0, row_index), (-1, row_index)),
+                  ("BACKGROUND", (0, row_index), (-1, row_index), _hex(COLOR_BAND_BG))]
+
+    table = Table(data, colWidths=list(widths), repeatRows=1)
+    table.setStyle(TableStyle(style))
+    return table
 
 
-def _set_paragraph(
-    para,
-    space_before: float | None = None,
-    space_after: float | None = None,
-    line_spacing: float | None = None,
-    align=None,
-    keep_with_next: bool | None = None,
-) -> None:
-    pf = para.paragraph_format
-    if space_before is not None:
-        pf.space_before = Pt(space_before)
-    if space_after is not None:
-        pf.space_after = Pt(space_after)
-    if line_spacing is not None:
-        pf.line_spacing = line_spacing
-    if align is not None:
-        para.alignment = align
-    if keep_with_next is not None:
-        pf.keep_with_next = keep_with_next
+def _facts_table(facts: Sequence[tuple[str, Any]], st, width: float) -> Table:
+    per_row = 4
+    cell_w = width / per_row
+    rows = []
+    for i in range(0, len(facts), per_row):
+        chunk = list(facts[i:i + per_row])
+        chunk += [("", "")] * (per_row - len(chunk))
+        rows.append([[Paragraph(_label(label), st["fact_label"]),
+                      Paragraph(str(value), st["fact_value"])] if label else ""
+                     for label, value in chunk])
+    table = Table(rows, colWidths=[cell_w] * per_row)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, _hex(COLOR_RULE_SOFT)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return table
 
 
-def _paragraph_bottom_border(para, color: str, width_eighths: int) -> None:
-    ppr = para._element.get_or_add_pPr()
-    borders = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), str(width_eighths))
-    bottom.set(qn("w:space"), "3")
-    bottom.set(qn("w:color"), color)
-    borders.append(bottom)
-    ppr.append(borders)
+def build_story(context: dict[str, Any], width: float) -> list:
+    """The report as a flat list of flowables."""
+    st = _styles()
+    story: list = []
+
+    # Cover
+    story += [Spacer(1, 200),
+              Paragraph(context["title"], st["cover_title"]),
+              Paragraph(context["subtitle"], st["cover_sub"]),
+              Spacer(1, 16)]
+    hr = Table([[""]], colWidths=[60])
+    hr.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 1.4, _hex(COLOR_CORAL))]))
+    hr.hAlign = "CENTER"
+    story += [hr, Spacer(1, 16),
+              Paragraph(context["job_name"], st["cover_field"]),
+              Paragraph(context["source_file"], st["cover_field"]),
+              Paragraph(context["generated"], st["cover_field"]),
+              PageBreak()]
+
+    sections = context["sections"]
+
+    # Contents and basis
+    story += _section_heading(None, "Contents", st, width)
+    toc_rows = [[Paragraph(_label(f"Section {i}"), st["toc_num"]),
+                 Paragraph(name, st["toc_name"])]
+                for i, name in enumerate(sections, start=1)]
+    toc = Table(toc_rows, colWidths=[70, width - 70])
+    toc.setStyle(TableStyle([
+        ("LINEBELOW", (0, 0), (-1, -1), 0.6, _hex(COLOR_RULE_SOFT)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story += [toc, Spacer(1, 14),
+              Paragraph(_label("Basis of this report"), st["sub"])]
+    story += _panel(context["basis"], st, width)
+
+    number = 0
+    for name in sections:
+        number += 1
+        if SECTION_STARTS_NEW_PAGE:
+            story.append(PageBreak())
+        story += _section_heading(number, name, st, width)
+        story += _SECTION_BUILDERS[name](context, st, width)
+    return story
 
 
-def _shade_cell(cell, hex_color: str) -> None:
-    shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), hex_color)
-    cell._tc.get_or_add_tcPr().append(shd)
+def _s_glance(ctx, st, width) -> list:
+    out = _generated(ctx["summary"], st, width)
+    out += _chart_block(ctx["glance_chart"], st, width,
+                        "Figure 1 · Main flow"
+                        + (" — full chart in the Links section"
+                           if ctx["full_chart"] != ctx["glance_chart"] else ""))
+    out.append(_facts_table(ctx["facts"], st, width))
+    return out
 
 
-def _cell_borders(cell, color: str, width_eighths: int) -> None:
-    tc_pr = cell._tc.get_or_add_tcPr()
-    for existing in tc_pr.findall(qn("w:tcBorders")):
-        tc_pr.remove(existing)
-    borders = OxmlElement("w:tcBorders")
-    for edge in ("top", "left", "bottom", "right"):
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:val"), "single")
-        el.set(qn("w:sz"), str(width_eighths))
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), color)
-        borders.append(el)
-    tc_pr.append(borders)
+def _s_inventory(ctx, st, width) -> list:
+    rows, bands = [], {}
+    for label, members in ctx["groups"]:
+        bands[len(rows) + 1] = f"{label} — {len(members)}"
+        rows.append([""] * 6)
+        for r in members:
+            rows.append([r["id"], r["name"], r["type"], r["object"],
+                         r["inputs"], r["outputs"]])
+    w = [0.10, 0.23, 0.18, 0.31, 0.09, 0.09]
+    return [_data_table(["ID", "Technical name", "Type", "Object", "In", "Out"],
+                        rows, [width * x for x in w], st, mono=[0, 1, 2, 3],
+                        right=[4, 5], bands=bands),
+            Paragraph(_label("Table 1 · Stage inventory"), st["caption"])]
 
 
-def _cell_margins(cell, twips: int) -> None:
-    tc_pr = cell._tc.get_or_add_tcPr()
-    mar = OxmlElement("w:tcMar")
-    for edge in ("top", "start", "bottom", "end"):
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:w"), str(twips))
-        el.set(qn("w:type"), "dxa")
-        mar.append(el)
-    tc_pr.append(mar)
+def _s_links(ctx, st, width) -> list:
+    rows = [[l["name"], l["from"], l["to"], l["kind"], l["columns"]] for l in ctx["links"]]
+    w = [0.21, 0.25, 0.25, 0.15, 0.14]
+    out = [_data_table(["Link", "From", "To", "Kind", "Columns"],
+                       rows, [width * x for x in w], st, mono=[0, 1, 2], right=[4]),
+           Paragraph(_label("Table 2 · Link inventory"), st["caption"])]
+    if ctx["full_chart"]:
+        out.append(Paragraph(_label("Full flowchart"), st["sub"]))
+        out += _chart_block(ctx["full_chart"], st, width, "Figure 2 · Every stage and link")
+    return out
 
 
-def _fixed_table_layout(table) -> None:
-    """Pin the column widths. Without this Word auto-fits, and one long
-    technical name is enough to widen its column and overflow the page."""
-    tbl_pr = table._tbl.tblPr
-    for existing in tbl_pr.findall(qn("w:tblLayout")):
-        tbl_pr.remove(existing)
-    layout = OxmlElement("w:tblLayout")
-    layout.set(qn("w:type"), "fixed")
-    tbl_pr.append(layout)
-
-
-def _repeat_header_row(row) -> None:
-    """Long tables repeat their header across page breaks. Without this the
-    second page of a wide stage table is a grid of numbers with no column names."""
-    tr_pr = row._tr.get_or_add_trPr()
-    el = OxmlElement("w:tblHeader")
-    el.set(qn("w:val"), "true")
-    tr_pr.append(el)
-
-
-def _cant_split_row(row) -> None:
-    tr_pr = row._tr.get_or_add_trPr()
-    el = OxmlElement("w:cantSplit")
-    tr_pr.append(el)
-
-
-def _add_field(paragraph, instruction: str) -> None:
-    """Insert a live Word field (PAGE, NUMPAGES) - python-docx has no API for these."""
-    run = paragraph.add_run()
-    begin = OxmlElement("w:fldChar")
-    begin.set(qn("w:fldCharType"), "begin")
-    instr = OxmlElement("w:instrText")
-    instr.set(qn("xml:space"), "preserve")
-    instr.text = f" {instruction} "
-    end = OxmlElement("w:fldChar")
-    end.set(qn("w:fldCharType"), "end")
-    run._element.append(begin)
-    run._element.append(instr)
-    run._element.append(end)
-    _set_run(run, font=FONT_MONO, size=SIZE_RUNNING, color=COLOR_INK_FAINT)
-
-
-class DocxBuilder:
-    """Writes one WorkflowGraph into a copy of the template."""
-
-    def __init__(self, graph: WorkflowGraph, narrative: Narrative):
-        self.graph = graph
-        self.narrative = narrative
-        self.doc = Document(TEMPLATE_DOCX_PATH)
-        self._table_number = 0
-        self.content_width = CONTENT_WIDTH_IN      # replaced by the measured width
-
-    # -- template preparation -------------------------------------------------
-
-    def _measure_content_width(self) -> None:
-        """Table widths come from the document, not from an assumed page size."""
-        section = self.doc.sections[-1]
-        try:
-            width = (
-                section.page_width.inches
-                - section.left_margin.inches
-                - section.right_margin.inches
-            )
-        except (TypeError, AttributeError):
-            width = CONTENT_WIDTH_IN
-        if not width or width < 2:
-            log.warning("Template page width looks wrong; falling back to %sin.", CONTENT_WIDTH_IN)
-            width = CONTENT_WIDTH_IN
-        self.content_width = round(width, 3)
-
-    def _reset_document_defaults(self) -> None:
-        """
-        Neutralise the template's document defaults.
-
-        Overriding the Normal style is not enough on its own: temp.docx also
-        carries w:docDefaults, which any paragraph or table cell that does not
-        set a property explicitly inherits from. Resetting both means the report
-        looks the same whatever the template was saved with.
-        """
-        styles_el = self.doc.styles.element
-        defaults = styles_el.find(qn("w:docDefaults"))
-        if defaults is None:
-            defaults = OxmlElement("w:docDefaults")
-            styles_el.insert(0, defaults)
-
-        rpr_default = defaults.find(qn("w:rPrDefault"))
-        if rpr_default is None:
-            rpr_default = OxmlElement("w:rPrDefault")
-            defaults.append(rpr_default)
-        for old in rpr_default.findall(qn("w:rPr")):
-            rpr_default.remove(old)
-        rpr = OxmlElement("w:rPr")
-        rfonts = OxmlElement("w:rFonts")
-        for slot in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
-            rfonts.set(qn(slot), FONT_SERIF)
-        rpr.append(rfonts)
-        for tag, val in (("w:sz", str(int(SIZE_BODY * 2))),
-                         ("w:szCs", str(int(SIZE_BODY * 2))),
-                         ("w:color", COLOR_INK)):
-            el = OxmlElement(tag)
-            el.set(qn("w:val"), val)
-            rpr.append(el)
-        rpr_default.append(rpr)
-
-        ppr_default = defaults.find(qn("w:pPrDefault"))
-        if ppr_default is None:
-            ppr_default = OxmlElement("w:pPrDefault")
-            defaults.append(ppr_default)
-        for old in ppr_default.findall(qn("w:pPr")):
-            ppr_default.remove(old)
-        ppr = OxmlElement("w:pPr")
-        spacing = OxmlElement("w:spacing")
-        spacing.set(qn("w:before"), "0")
-        spacing.set(qn("w:after"), str(int(SPACE_AFTER_PARAGRAPH * 20)))
-        ppr.append(spacing)
-        ind = OxmlElement("w:ind")
-        for slot in ("w:left", "w:right", "w:firstLine"):
-            ind.set(qn(slot), "0")
-        ppr.append(ind)
-        ppr_default.append(ppr)
-
-    def _override_template_defaults(self) -> None:
-        """The template ships with Word's default styles. Redefine the ones the
-        report uses so its own formatting wins."""
-        self._reset_document_defaults()
-        styles = self.doc.styles
-        normal = styles["Normal"]
-        normal.font.name = FONT_SERIF
-        normal.font.size = Pt(SIZE_BODY)
-        normal.font.color.rgb = _rgb(COLOR_INK)
-        rpr = normal.element.get_or_add_rPr()
-        rfonts = rpr.find(qn("w:rFonts"))
-        if rfonts is None:
-            rfonts = OxmlElement("w:rFonts")
-            rpr.append(rfonts)
-        for slot in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
-            rfonts.set(qn(slot), FONT_SERIF)
-        pf = normal.paragraph_format
-        pf.space_before = Pt(0)
-        pf.space_after = Pt(SPACE_AFTER_PARAGRAPH)
-        pf.line_spacing = LINE_SPACING_BODY
-
-        for section in self.doc.sections:
-            if FORCE_PAGE_SIZE:
-                section.page_width = Inches(PAGE_WIDTH_IN)
-                section.page_height = Inches(PAGE_HEIGHT_IN)
-            if FORCE_PAGE_MARGINS:
-                section.top_margin = Inches(PAGE_MARGIN_TOP_IN)
-                section.bottom_margin = Inches(PAGE_MARGIN_BOTTOM_IN)
-                section.left_margin = Inches(PAGE_MARGIN_LEFT_IN)
-                section.right_margin = Inches(PAGE_MARGIN_RIGHT_IN)
-        self._measure_content_width()
-
-    def _trim_trailing_empty_paragraphs(self) -> None:
-        body = self.doc.element.body
-        for para in reversed(self.doc.paragraphs):
-            if para.text.strip():
-                break
-            if "w:br" in para._element.xml:      # keep an explicit page break
-                break
-            body.remove(para._element)
-
-    def _collapse_trailing_page_breaks(self) -> None:
-        """
-        Keep at most one page break at the end of the template.
-
-        A cover page followed by two breaks is a common way to produce a blank
-        page 2 in Word, and it would push the contents to page 3.
-        """
-        body = self.doc.element.body
-        found = []
-        for el in reversed(list(body)):
-            tag = el.tag.rsplit("}", 1)[-1]
-            if tag == "sectPr":
-                continue
-            if tag != "p":
-                break
-            if 'w:type="page"' in el.xml and not el.xpath(".//w:t"):
-                found.append(el)
-                continue
-            break
-        for extra in found[1:]:                 # found[0] is the last one; keep it
-            body.remove(extra)
-        if len(found) > 1:
-            log.info(
-                "Template ended on %s page breaks; kept one so the contents follows "
-                "the cover directly.", len(found),
-            )
-
-    def _template_ends_with_page_break(self) -> bool:
-        """True when the template already breaks to a new page after the cover."""
-        body = self.doc.element.body
-        for el in reversed(list(body)):
-            tag = el.tag.rsplit("}", 1)[-1]
-            if tag == "sectPr":
-                continue                       # section properties, not content
-            if tag == "tbl":
-                return False                   # a table is real content
-            if tag == "p":
-                xml = el.xml
-                if 'w:type="page"' in xml or "w:type='page'" in xml:
-                    return True                # explicit page break
-                if "<w:br" in xml and "sectPr" in xml:
-                    return True                # section break acting as one
-                if el.xpath(".//w:t"):
-                    return False               # text on the last page, no break
-                continue                       # empty paragraph, keep looking back
-        return False
-
-    def _start_report_page(self) -> None:
-        setting = INSERT_PAGE_BREAK_AFTER_TEMPLATE
-        if isinstance(setting, str) and setting.lower() == "auto":
-            insert = not self._template_ends_with_page_break()
-            log.info(
-                "Template already ends on a page break; starting the report there."
-                if not insert else
-                "Template has no page break after the cover; inserting one."
-            )
+def _s_detail(ctx, st, width) -> list:
+    out = []
+    for stage in ctx["detail"]:
+        block = [Paragraph(_label(f"{stage['name']} · {stage['type']} · {stage['id']}"),
+                           st["sub"])]
+        if stage["properties"]:
+            rows = [[k, v] for k, v in stage["properties"].items()]
+            table = _data_table(["Property", "Value"], rows,
+                                [width * 0.32, width * 0.68], st, mono=[1])
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 1), (0, -1), _hex(COLOR_KEY_BG))]))
+            block.append(table)
+        if not stage["description"]["missing"]:
+            block += _generated([stage["description"]["text"]], st, width)
         else:
-            insert = bool(setting)
+            block.append(Spacer(1, 8))
+        out.append(KeepTogether(block))
+    return out
 
-        if insert:
-            para = self.doc.add_paragraph()
-            para.add_run().add_break(WD_BREAK.PAGE)
-            _set_paragraph(para, space_before=0, space_after=0)
 
-    def _build_running_header_footer(self) -> None:
-        """
-        In template mode the header and footer defined in temp.docx are left
-        exactly as they are, so whatever is set there appears on every page.
+def _s_paths(ctx, st, width) -> list:
+    rows = [[p["index"], p["route"], p["length"], p["explanation"]] for p in ctx["paths"]]
+    w = [0.05, 0.36, 0.10, 0.49]
+    return [_data_table(["#", "Route", "Stages", "What it represents"],
+                        rows, [width * x for x in w], st, mono=[1], right=[0, 2]),
+            Paragraph(_label("Table 3 · Data paths"), st["caption"])]
 
-        Word stores a header once per section, not per page, so a header placed
-        in the template shows on the whole document by design - there is nothing
-        to copy forward.
-        """
-        section = self.doc.sections[-1]
 
-        if HEADER_FOOTER_MODE == "template":
-            if ADD_PAGE_NUMBER_IF_TEMPLATE_HAS_NONE:
-                self._add_page_number_if_absent(section)
-            return
+def _s_findings(ctx, st, width) -> list:
+    rows = [[f["ref"], f["category"], f["obj"], f["text"]] for f in ctx["findings"]]
+    w = [0.09, 0.17, 0.21, 0.53]
+    return [_data_table(["Ref", "Category", "Object", "Finding"],
+                        rows, [width * x for x in w], st, mono=[0, 2]),
+            Paragraph(_label("Table 4 · Findings"), st["caption"])]
 
-        section.different_first_page_header_footer = True   # cover stays clean
 
-        if SHOW_RUNNING_HEADER:
-            para = section.header.paragraphs[0]
-            para.text = ""
-            _set_paragraph(para, space_after=2)
-            left = para.add_run(RUNNING_HEADER_LEFT)
-            _set_run(left, FONT_MONO, SIZE_RUNNING, color=COLOR_INK_FAINT, caps=True)
-            para.add_run("\t\t")
-            right = para.add_run(self.graph.job.job_name)
-            _set_run(right, FONT_MONO, SIZE_RUNNING, color=COLOR_INK_FAINT, caps=True)
-            _paragraph_bottom_border(para, COLOR_RULE, 4)
+_SECTION_BUILDERS = {
+    "At a Glance": _s_glance,
+    "Stage Inventory": _s_inventory,
+    "Links": _s_links,
+    "Stage Detail": _s_detail,
+    "Data Paths": _s_paths,
+    "Findings": _s_findings,
+}
 
-        if SHOW_RUNNING_FOOTER:
-            para = section.footer.paragraphs[0]
-            para.text = ""
-            _set_paragraph(para, space_before=2)
-            src = para.add_run(self.graph.job.source_file)
-            _set_run(src, FONT_MONO, SIZE_RUNNING, color=COLOR_INK_FAINT)
-            para.add_run("\t\t")
-            self._append_page_fields(para)
 
-    @staticmethod
-    def _append_page_fields(para) -> None:
-        before, _, after = FOOTER_PAGE_FORMAT.partition("{page}")
-        mid, _, tail = after.partition("{total}")
-        for text, field in ((before, "PAGE"), (mid, "NUMPAGES")):
-            if text:
-                run = para.add_run(text)
-                _set_run(run, FONT_MONO, SIZE_RUNNING, color=COLOR_INK_FAINT)
-            _add_field(para, field)
-        if tail:
-            run = para.add_run(tail)
-            _set_run(run, FONT_MONO, SIZE_RUNNING, color=COLOR_INK_FAINT)
+def render_pdf(context: dict[str, Any], pdf_path: Path) -> Path:
+    page = PAGE_SIZES.get(PAGE_SIZE.upper(), A4)
+    width = page[0] - 2 * MARGIN_SIDE_MM * mm
 
-    def _add_page_number_if_absent(self, section) -> None:
-        """Only touches the template footer when it carries no page number."""
-        footer = section.footer
-        if "PAGE" in footer._element.xml.upper():
-            return
-        para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-        if para.text.strip():
-            para.add_run("\t\t")
-        else:
-            para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        self._append_page_fields(para)
+    doc = BaseDocTemplate(
+        str(pdf_path), pagesize=page,
+        leftMargin=MARGIN_SIDE_MM * mm, rightMargin=MARGIN_SIDE_MM * mm,
+        topMargin=MARGIN_TOP_MM * mm, bottomMargin=MARGIN_BOTTOM_MM * mm,
+        title=f"{context['title']} — {context['job_name']}", author=context["title"])
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="body",
+                  leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+    doc.addPageTemplates([PageTemplate(id="report", frames=[frame])])
 
-    # -- primitives -----------------------------------------------------------
+    canvas_class = type("_ReportCanvas", (_NumberedCanvas,), {
+        "_header_left": context["title"].upper(),
+        "_header_right": context["job_name"].upper(),
+        "_footer_left": context["source_file"],
+    })
+    doc.build(build_story(context, width), canvasmaker=canvas_class)
 
-    def _heading(self, eyebrow: str, title: str, first: bool = False) -> None:
-        eb = self.doc.add_paragraph()
-        _set_paragraph(
-            eb,
-            space_before=0 if first else SPACE_BEFORE_SECTION,
-            space_after=1,
-            line_spacing=1.0,
-            keep_with_next=True,
-        )
-        run = eb.add_run(eyebrow.upper() if UPPERCASE_SECTION_NUMBER else eyebrow)
-        _set_run(
-            run, FONT_MONO, SIZE_SECTION_NUMBER, bold=True,
-            color=COLOR_CORAL_DEEP, spacing_twips=SECTION_NUMBER_SPACING_TWIPS,
-        )
-
-        tp = self.doc.add_paragraph()
-        _set_paragraph(
-            tp, space_before=0, space_after=SPACE_AFTER_SECTION_TITLE,
-            line_spacing=1.0, keep_with_next=True,
-        )
-        trun = tp.add_run(title)
-        _set_run(trun, FONT_SANS, SIZE_SECTION_TITLE, bold=True, color=COLOR_CORAL)
-        _paragraph_bottom_border(tp, COLOR_CORAL_LINE, SECTION_RULE_WIDTH_EIGHTHS)
-
-    def _prose(self, text: str) -> None:
-        blocks = limit_prose(text)
-        if not blocks:
-            return
-        for block in blocks:
-            para = self.doc.add_paragraph()
-            _set_paragraph(
-                para,
-                space_after=SPACE_AFTER_PARAGRAPH,
-                line_spacing=LINE_SPACING_BODY,
-                align=WD_ALIGN_PARAGRAPH.JUSTIFY if JUSTIFY_DESCRIPTIONS else None,
-            )
-            run = para.add_run(block)
-            _set_run(run, FONT_SERIF, SIZE_BODY, color=COLOR_INK)
-
-    def _caption(self, text: str) -> None:
-        self._table_number += 1
-        para = self.doc.add_paragraph()
-        _set_paragraph(para, space_before=SPACE_AFTER_TABLE, space_after=SPACE_AFTER_CAPTION)
-        run = para.add_run(f"Table {self._table_number} · {text}")
-        _set_run(run, FONT_MONO, SIZE_CAPTION, bold=True, color=COLOR_CORAL_DEEP, caps=True)
-
-    def _figure_caption(self, text: str) -> None:
-        para = self.doc.add_paragraph()
-        _set_paragraph(para, space_before=SPACE_AFTER_TABLE, space_after=SPACE_AFTER_CAPTION)
-        run = para.add_run(text)
-        _set_run(run, FONT_MONO, SIZE_CAPTION, bold=True, color=COLOR_CORAL_DEEP, caps=True)
-
-    def _monospace_block(self, text: str, size: float = SIZE_DIAGRAM) -> None:
-        """The arrow diagram. Rendered as text so it stays selectable in the PDF
-        and needs no image toolchain - python-docx cannot place SVG."""
-        table = self.doc.add_table(rows=1, cols=1)
-        table.autofit = False
-        if TABLE_FIXED_LAYOUT:
-            _fixed_table_layout(table)
-        cell = table.cell(0, 0)
-        _shade_cell(cell, COLOR_DIAGRAM_BG)
-        _cell_borders(cell, COLOR_RULE, TABLE_BORDER_WIDTH_EIGHTHS)
-        _cell_margins(cell, 140)
-        cell.width = Inches(self.content_width)
-        para = cell.paragraphs[0]
-        _set_paragraph(para, space_before=0, space_after=0, line_spacing=1.15)
-        for i, line in enumerate(text.split("\n")):
-            if i:
-                para.add_run().add_break()
-            run = para.add_run(line.replace("\t", "    "))
-            _set_run(run, FONT_MONO, size, color=COLOR_INK)
-
-    def _table(
-        self,
-        headers: Sequence[str] | None,
-        rows: Sequence[Sequence[Any]],
-        widths: Sequence[float],
-        mono_columns: Iterable[int] = (),
-        desc_columns: Iterable[int] = (),
-        key_column: int | None = None,
-        limits: dict[int, int] | None = None,
-    ):
-        """
-        rows may contain plain strings or (text, style) tuples where style is
-        'na' for a missing-value cell.
-
-        `limits` caps a column's characters. Description columns default to
-        MAX_DESCRIPTION_CHARS so a long model response cannot change the layout.
-        """
-        mono_columns = set(mono_columns)
-        desc_columns = set(desc_columns)
-        limits = dict(limits or {})
-        for col in desc_columns:
-            limits.setdefault(col, MAX_DESCRIPTION_CHARS)
-        n_cols = len(widths)
-        table = self.doc.add_table(rows=0, cols=n_cols)
-        table.alignment = WD_TABLE_ALIGNMENT.LEFT
-        table.autofit = False
-        if TABLE_FIXED_LAYOUT:
-            _fixed_table_layout(table)
-
-        def fill(cells, values, header: bool) -> None:
-            for idx, (cell, value) in enumerate(zip(cells, values)):
-                cell.width = Inches(widths[idx])
-                _cell_borders(
-                    cell, COLOR_RULE,
-                    TABLE_HEAD_BORDER_WIDTH_EIGHTHS if header else TABLE_BORDER_WIDTH_EIGHTHS,
-                )
-                _cell_margins(cell, TABLE_CELL_PAD_TWIPS)
-
-                text, kind = (value if isinstance(value, tuple) else (value, None))
-                # Only description cells hold model-written text.
-                text = clean_text(text, markdown=idx in desc_columns and not header)
-                if not header and idx in limits:
-                    text = truncate_at_sentence(text, limits[idx])
-                text = soften_long_tokens(text)
-
-                para = cell.paragraphs[0]
-                _set_paragraph(
-                    para, space_before=0, space_after=0,
-                    line_spacing=LINE_SPACING_TABLE,
-                    align=(
-                        WD_ALIGN_PARAGRAPH.JUSTIFY
-                        if (JUSTIFY_DESCRIPTIONS and idx in desc_columns and not header)
-                        else None
-                    ),
-                )
-                run = para.add_run(text)
-
-                if header:
-                    _shade_cell(cell, COLOR_TABLE_HEAD_BG)
-                    _set_run(run, FONT_MONO, SIZE_TABLE_HEAD, bold=True,
-                             color=COLOR_INK_DIM, caps=True)
-                elif kind == "na":
-                    _set_run(run, FONT_SERIF, SIZE_TABLE, italic=True, color=COLOR_INK_FAINT)
-                elif key_column is not None and idx == key_column:
-                    _shade_cell(cell, COLOR_KEY_CELL_BG)
-                    _set_run(run, FONT_MONO, SIZE_TABLE_HEAD, color=COLOR_INK_DIM, caps=True)
-                elif idx in mono_columns:
-                    _set_run(run, FONT_MONO, SIZE_TABLE, color=COLOR_INK)
-                else:
-                    _set_run(run, FONT_SERIF, SIZE_TABLE, color=COLOR_INK)
-
-        if headers:
-            row = table.add_row()
-            fill(row.cells, headers, header=True)
-            if TABLE_REPEAT_HEADER_ROW:
-                _repeat_header_row(row)
-
-        for values in rows:
-            row = table.add_row()
-            if TABLE_ROWS_KEEP_TOGETHER:
-                _cant_split_row(row)
-            fill(row.cells, values, header=False)
-
-        return table
-
-    # -- sections -------------------------------------------------------------
-
-    def _page_break(self) -> None:
-        para = self.doc.add_paragraph()
-        para.add_run().add_break(WD_BREAK.PAGE)
-        _set_paragraph(para, space_before=0, space_after=0)
-
-    def build(self) -> Document:
-        self._override_template_defaults()
-        if TRIM_TEMPLATE_TRAILING_EMPTY_PARAGRAPHS:
-            self._trim_trailing_empty_paragraphs()
-        if COLLAPSE_EXTRA_TEMPLATE_PAGE_BREAKS:
-            self._collapse_trailing_page_breaks()
-        self._start_report_page()
-        self._build_running_header_footer()
-
-        sections = self._sections_with_content()
-        self._contents([title for title, _ in sections])
-
-        for number, (title, emit) in enumerate(sections, start=1):
-            if SECTION_STARTS_NEW_PAGE:
-                self._page_break()
-            self._heading(f"Section {number}", title)
-            emit()
-        return self.doc
-
-    def _sections_with_content(self) -> list[tuple[str, Any]]:
-        """Sections are numbered as they appear, so a report has no gaps."""
-        g = self.graph
-        has_architecture = bool(
-            self.narrative.architecture_diagram
-            or self.narrative.architecture_description
-            or build_arrow_diagram(g, self.content_width)
-        )
-        candidates = [
-            ("Workflow Overview", self._overview, True),
-            ("Workflow Stages", self._stages, bool(g.stages)),
-            ("Workflow Architecture", self._architecture, has_architecture),
-            ("Sources", self._sources, bool(g.sources)),
-            ("Transformations", self._transformations, bool(g.transformations)),
-            ("References", self._references, bool(g.references)),
-            ("Targets", self._targets, bool(g.targets)),
-            ("Data Path", self._paths, bool(g.paths)),
-            ("Observations", self._observations,
-             bool(g.observations or self.narrative.unverified_identifiers)),
-        ]
-        if not SKIP_EMPTY_SECTIONS:
-            return [(t, f) for t, f, _ in candidates]
-        return [(t, f) for t, f, present in candidates if present]
-
-    def _contents(self, titles: Sequence[str]) -> None:
-        self._heading(CONTENTS_EYEBROW, CONTENTS_HEADING, first=True)
-        for number, title in enumerate(titles, start=1):
-            para = self.doc.add_paragraph()
-            _set_paragraph(para, space_before=0, space_after=4, line_spacing=1.0)
-            label = para.add_run(f"Section {number}")
-            _set_run(label, FONT_MONO, SIZE_CAPTION, bold=True,
-                     color=COLOR_CORAL_DEEP, caps=True)
-            para.add_run("   ")
-            name = para.add_run(title)
-            _set_run(name, FONT_SERIF, SIZE_TOC, color=COLOR_INK)
-
-    def _overview(self) -> None:
-        g = self.graph
-        rows = [
-            ("Filename", g.job.source_file),
-            ("# of sources", str(len(g.sources))),
-            ("# of targets", str(len(g.targets))),
-            ("# of references", str(len(g.references))),
-            ("# of transformations", str(len(g.transformations))),
-            ("# of total stages",
-             str(len(g.sources) + len(g.references) + len(g.transformations) + len(g.targets))),
-        ]
-        self._table(None, rows, [2.20, self.content_width - 2.20],
-                    mono_columns=[1], key_column=0)
-        self._caption("Workflow overview")
-
-    def _stages(self) -> None:
-        rows = []
-        for s in self.graph.stages:
-            rows.append([
-                s.identifier,
-                s.display_name if s.name else (TEXT_NOT_IDENTIFIED, "na"),
-                s.display_type,
-                str(len(s.inputs)),
-                str(len(s.outputs)),
-                ROLE_LABELS[s.role] if s.role != ROLE_UNCLASSIFIED
-                else (TEXT_NOT_APPLICABLE, "na"),
-            ])
-        self._table(
-            ["ID", "Technical name", "Type", "# input links", "# output links", "Role"],
-            rows,
-            [0.70, 1.65, 1.40, 0.62, 0.62, self.content_width - 4.99],
-            mono_columns=[0, 1, 2, 3, 4],
-        )
-        self._caption("Workflow stages and data objects")
-
-    def _architecture(self) -> None:
-        fitted = fit_diagram(self.narrative.architecture_diagram, self.content_width)
-        if fitted is None:
-            fitted = fit_diagram(build_arrow_diagram(self.graph, self.content_width),
-                                 self.content_width)
-        if fitted:
-            diagram, size = fitted
-            self._monospace_block(diagram, size)
-            self._figure_caption("Figure 1 \u00b7 Workflow architecture")
-        self._prose(self.narrative.architecture_description)
-
-    def _entity_description(self, stage: Stage) -> Any:
-        text = self.narrative.entity_descriptions.get(stage.display_name, "").strip()
-        return text if text else (TEXT_NOT_IDENTIFIED, "na")
-
-    def _sources(self) -> None:
-        rows = []
-        for s in self.graph.sources:
-            obj = stage_object(s)
-            rows.append([
-                s.display_name, s.identifier, s.display_type,
-                obj if obj else (TEXT_NOT_IDENTIFIED, "na"),
-                ", ".join(s.outputs) or TEXT_NOT_APPLICABLE,
-                self._entity_description(s),
-            ])
-        self._table(
-            ["Technical name", "ID", "Type", "Object", "Output link", "Description"],
-            rows,
-            [1.15, 0.50, 1.00, 1.25, 0.90, self.content_width - 4.80],
-            mono_columns=[0, 1, 2, 3, 4], desc_columns=[5],
-        )
-        self._caption("Sources")
-
-    def _transformations(self) -> None:
-        rows = [[
-            s.display_name, s.identifier, s.display_type,
-            f"{len(s.inputs)} / {len(s.outputs)}",
-            self._entity_description(s),
-        ] for s in self.graph.transformations]
-        self._table(
-            ["Technical name", "ID", "Type", "In / Out", "Description"],
-            rows,
-            [1.15, 0.50, 1.05, 0.60, self.content_width - 3.30],
-            mono_columns=[0, 1, 2, 3], desc_columns=[4],
-        )
-        self._caption("Transformations")
-
-    def _references(self) -> None:
-        rows = []
-        for s in self.graph.references:
-            used_by = ", ".join(
-                sorted({_name_of(self.graph, l.to_stage) for l in self.graph.outgoing(s)}))
-            rows.append([
-                s.display_name, s.identifier, s.display_type,
-                used_by if used_by else (TEXT_NOT_IDENTIFIED, "na"),
-                self._entity_description(s),
-            ])
-        self._table(
-            ["Technical name", "ID", "Type", "Used by", "Description"],
-            rows,
-            [1.15, 0.50, 1.10, 1.00, self.content_width - 3.75],
-            mono_columns=[0, 1, 2, 3], desc_columns=[4],
-        )
-        self._caption("References")
-
-    def _targets(self) -> None:
-        rows = []
-        for s in self.graph.targets:
-            obj = stage_object(s)
-            mode = s.prop("WriteMode", "WriteMethod", "UpdateAction")
-            rows.append([
-                s.display_name, s.identifier, s.display_type,
-                obj if obj else (TEXT_NOT_IDENTIFIED, "na"),
-                mode if mode else (TEXT_NOT_IDENTIFIED, "na"),
-                self._entity_description(s),
-            ])
-        self._table(
-            ["Technical name", "ID", "Type", "Object", "Write mode", "Description"],
-            rows,
-            [1.15, 0.50, 1.00, 1.20, 0.75, self.content_width - 4.60],
-            mono_columns=[0, 1, 2, 3], desc_columns=[5],
-        )
-        self._caption("Targets")
-
-    def _paths(self) -> None:
-        rows = []
-        for i, path in enumerate(self.graph.paths, start=1):
-            explanation = self.narrative.path_explanations.get(i, "").strip()
-            rows.append([
-                str(i), " \u2192 ".join(path), str(len(path)),
-                explanation if explanation else (TEXT_NOT_IDENTIFIED, "na"),
-            ])
-        self._table(
-            ["#", "Path", "Stages in path", "Explanation"],
-            rows,
-            [0.32, 2.35, 0.50, self.content_width - 3.17],
-            mono_columns=[0, 1, 2], desc_columns=[3],
-            limits={1: MAX_PATH_CELL_CHARS},
-        )
-        self._caption("Data paths")
-        self._prose(self.narrative.path_summary)
-
-    def _observations(self) -> None:
-        rows = [[
-            o.ref, o.category,
-            o.obj if o.obj != TEXT_NOT_APPLICABLE else (TEXT_NOT_APPLICABLE, "na"),
-            o.text,
-        ] for o in self.graph.observations]
-        for ident in self.narrative.unverified_identifiers:
-            rows.append([
-                f"OBS-{len(rows) + 1:02d}", "Unverified reference", ident,
-                f"The descriptive text refers to {ident}, which does not appear in the "
-                "export. The reference could not be verified against the source file.",
-            ])
-        self._table(
-            ["Ref", "Category", "Object", "Observation"],
-            rows,
-            [0.68, 1.10, 0.85, self.content_width - 2.63],
-            mono_columns=[0, 2], desc_columns=[3],
-        )
-        self._caption("Observations")
+    if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+        raise RuntimeError(f"No PDF was produced at {pdf_path}.")
+    return pdf_path
 
 
 # =============================================================================
-# SECTION F   PDF CONVERSION
-# =============================================================================
-# docx2pdf drives Word through COM. Three things break in production: COM not
-# initialised on the worker thread, Word not being concurrent, and stray
-# WINWORD.EXE after a crash.
-
-_WORD_LOCK = threading.Lock()
-
-
-def convert_to_pdf(docx_path: Path, pdf_path: Path) -> None:
-    """
-    Convert with Word via COM. Isolated behind one function so that swapping in
-    LibreOffice for a non-Windows deployment is a single-file change:
-
-        soffice --headless --convert-to pdf --outdir <dir> <docx>
-    """
-    # COM must be initialised per thread. Flask serves each request on a worker
-    # thread, so the main thread's initialisation does not apply - this is the
-    # "CoInitialize has not been called" failure.
-    pythoncom.CoInitialize()
-    try:
-        # Two simultaneous conversions on one Word instance hang or corrupt the
-        # output, so conversion is serialised.
-        with _WORD_LOCK:
-            docx_to_pdf(str(docx_path), str(pdf_path))
-    finally:
-        _quit_stray_word()
-        pythoncom.CoUninitialize()
-
-    if not pdf_path.is_file():
-        raise RuntimeError(f"Word did not produce {pdf_path.name}.")
-
-
-def _quit_stray_word() -> None:
-    """A crash mid-conversion leaves Word resident; enough of them exhaust the box."""
-    try:
-        word = win32com.client.GetActiveObject("Word.Application")
-        if word.Documents.Count == 0:
-            word.Quit()
-    except Exception:
-        pass          # no running instance, or it is in use - nothing to clean up
-
-
-# =============================================================================
-# SECTION G   ORCHESTRATION AND CLI
+# SECTION F   ORCHESTRATION AND CLI
 # =============================================================================
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -2587,104 +1949,62 @@ def _safe_name(text: str) -> str:
 
 
 def _unique_stem(stem: str, used: set[str]) -> str:
-    """
-    Two uploads can carry the same filename, and two files in different folders
-    can share a stem. Without this the second report overwrites the first on
-    disk and shadows it inside the ZIP.
-    """
-    candidate = stem
-    n = 2
+    """Two uploads can share a filename; without this the second overwrites the
+    first and shadows it inside the ZIP."""
+    candidate, n = stem, 2
     while candidate.lower() in used:
-        candidate = f"{stem}_{n}"
-        n += 1
+        candidate, n = f"{stem}_{n}", n + 1
     used.add(candidate.lower())
     return candidate
 
 
 def build_report(job: ParsedJob, out_dir: Path, stem: str) -> Path:
-    """Analyse one job, write the .docx, convert it, and return the .pdf path."""
     graph = analyze(job)
     narrative = generate_narrative(graph)
-
-    docx_path = out_dir / f"{stem}.docx"
-    pdf_path = out_dir / f"{stem}.pdf"
-
-    DocxBuilder(graph, narrative).build().save(str(docx_path))
-    log.info("Wrote %s", docx_path.name)
-
-    # Convert in a temp directory and move the result. Word's file locking makes
-    # conversion directly onto a network path unreliable.
-    with tempfile.TemporaryDirectory(prefix="wf_report_") as tmp:
-        tmp_dir = Path(tmp)
-        tmp_docx = tmp_dir / docx_path.name
-        tmp_pdf = tmp_dir / pdf_path.name
-        shutil.copy2(docx_path, tmp_docx)
-        convert_to_pdf(tmp_docx, tmp_pdf)
-        shutil.move(str(tmp_pdf), str(pdf_path))
-
-    if not KEEP_INTERMEDIATE_DOCX:
-        docx_path.unlink(missing_ok=True)
-
+    pdf_path = render_pdf(build_context(graph, narrative), out_dir / f"{stem}.pdf")
     log.info("Wrote %s", pdf_path.name)
     return pdf_path
 
 
-def build_reports_for_file(
-    xml_path: Path, out_dir: Path, used_names: set[str] | None = None
-) -> list[Path]:
-    """
-    One PDF per job. A file holding several jobs produces several reports rather
-    than silently documenting the first one.
-    """
+def build_reports_for_file(xml_path: Path, out_dir: Path,
+                           used_names: set[str] | None = None) -> list[Path]:
+    """One PDF per job: a file holding several jobs produces several reports
+    rather than silently documenting the first."""
     used_names = used_names if used_names is not None else set()
     jobs = DataStageParser(xml_path).parse_all_jobs()
     stem = _safe_name(xml_path.stem)
-    pdfs: list[Path] = []
-
+    pdfs = []
     for job in jobs:
         if not job.stages:
-            log.warning(
-                "%s / %s contains no stages; no report generated.",
-                xml_path.name, job.job_name,
-            )
+            log.warning("%s / %s has no stages; skipped.", xml_path.name, job.job_name)
             continue
         base = stem if len(jobs) == 1 else f"{stem}__{_safe_name(job.job_name)}"
         pdfs.append(build_report(job, out_dir, _unique_stem(base, used_names)))
-
     return pdfs
 
 
 def generate(inputs: Sequence[str | Path], out_dir: str | Path) -> Path:
-    """
-    Main entry point, including for a Flask route.
-
-    Returns a single .pdf when exactly one report was produced, otherwise a .zip
-    containing every report.
-    """
+    """Main entry point. One report gives a .pdf, more give a .zip."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pdfs: list[Path] = []
     failures: list[str] = []
-    used_names: set[str] = set()
+    used: set[str] = set()
 
     for raw in inputs:
         path = Path(raw)
         try:
-            pdfs.extend(build_reports_for_file(path, out_dir, used_names))
+            pdfs.extend(build_reports_for_file(path, out_dir, used))
         except ParseError as exc:
             failures.append(f"{path.name}: {exc}")
             log.error("%s", exc)
-        except Exception as exc:                       # one bad file must not
-            failures.append(f"{path.name}: {exc}")     # sink the whole batch
+        except Exception as exc:                    # one bad file must not sink the batch
+            failures.append(f"{path.name}: {exc}")
             log.exception("Failed to process %s", path.name)
 
     if not pdfs:
-        raise RuntimeError(
-            "No reports were generated.\n" + "\n".join(failures)
-            if failures else "No reports were generated."
-        )
-
+        raise RuntimeError("No reports were generated.\n" + "\n".join(failures))
     if len(pdfs) == 1 and not failures:
         return pdfs[0]
 
@@ -2693,33 +2013,21 @@ def generate(inputs: Sequence[str | Path], out_dir: str | Path) -> Path:
         for pdf in pdfs:
             archive.write(pdf, arcname=pdf.name)
         if failures:
-            # A batch that partly failed says so inside the download, rather
-            # than quietly returning fewer files than were uploaded.
-            archive.writestr(
-                "NOT_PROCESSED.txt",
-                "The following inputs could not be processed:\n\n" + "\n".join(failures) + "\n",
-            )
+            archive.writestr("NOT_PROCESSED.txt",
+                             "These inputs could not be processed:\n\n" + "\n".join(failures))
     log.info("Wrote %s (%s report(s))", zip_path.name, len(pdfs))
     return zip_path
 
 
 class ReportStream(io.BytesIO):
-    """
-    The result of document_generate().
-
-    The route names the return value `stream`, but it is not certain whether the
-    previous version handed back bytes or a path, so this is both: it reads like
-    a file object, it satisfies os.PathLike, and str() gives the path on disk.
-    Flask's send_file accepts it either way.
-    """
+    """Both a file object and a path, because the route may treat it as either.
+    Flask's send_file accepts it both ways."""
 
     def __init__(self, path: Path):
         super().__init__(path.read_bytes())
         self.path = path
         self.name = path.name
-        self.mimetype = (
-            "application/zip" if path.suffix == ".zip" else "application/pdf"
-        )
+        self.mimetype = "application/zip" if path.suffix == ".zip" else "application/pdf"
 
     def __fspath__(self) -> str:
         return str(self.path)
@@ -2732,22 +2040,14 @@ class ReportStream(io.BytesIO):
 
 
 def _resolve_export_path(file_name: str | Path, project: str | None) -> Path:
-    """
-    Turn a selected file name into a path on disk.
-
-    The route passes a project name and a file name rather than a path, and the
-    convention that joins them is not recorded anywhere, so each plausible
-    arrangement is tried in turn and the one that exists wins. The failure
-    message lists everything that was tried, which is usually enough to identify
-    the real convention on the first run.
-    """
+    """The route passes a project and a file name, not a path, and the convention
+    joining them is not recorded anywhere, so each arrangement is tried."""
     candidate = Path(file_name)
     if candidate.is_file():
         return candidate
 
-    tried: list[str] = [str(candidate)]
+    tried = [str(candidate)]
     roots = [Path(r) for r in PROJECT_ROOTS]
-
     layouts: list[Path] = []
     for root in roots:
         if project:
@@ -2762,13 +2062,11 @@ def _resolve_export_path(file_name: str | Path, project: str | None) -> Path:
             log.info("Resolved %s to %s", file_name, layout)
             return layout
 
-    # Last resort: look for the filename anywhere under the roots.
     for root in roots:
         if not root.is_dir():
             continue
         for depth in range(1, PROJECT_FILE_SEARCH_DEPTH + 1):
-            pattern = "/".join(["*"] * depth) + "/" + candidate.name
-            for hit in root.glob(pattern):
+            for hit in root.glob("/".join(["*"] * depth) + "/" + candidate.name):
                 if hit.is_file():
                     log.info("Found %s by searching %s: %s", candidate.name, root, hit)
                     return hit
@@ -2776,43 +2074,27 @@ def _resolve_export_path(file_name: str | Path, project: str | None) -> Path:
     raise FileNotFoundError(
         f"Could not find the export '{file_name}'"
         + (f" for project '{project}'" if project else "")
-        + ".\nLooked in:\n  "
-        + "\n  ".join(tried)
-        + "\nAdd the correct directory to PROJECT_ROOTS in generate_doc.py."
-    )
+        + ".\nLooked in:\n  " + "\n  ".join(tried)
+        + "\nAdd the correct directory to PROJECT_ROOTS in generate_doc.py.")
 
 
 def document_generate(*args: Any, **kwargs: Any) -> ReportStream:
-    """
-    Entry point for the Flask route, kept at its original name.
+    """Entry point for the Flask route.
 
         stream = document_generate(project_name_selection, file_name_selection)
-
-    The file selection may be one name or several; several produce a ZIP. Names
-    are resolved against PROJECT_ROOTS - see _resolve_export_path.
-
-    Also accepts the other shapes this function has been called with:
-
-        document_generate("export.xml")
-        document_generate(["a.xml", "b.xml"], out_dir="reports")
-        document_generate(project="P1", file_name_selection=["a.xml"])
     """
-    project: Any = None
-    selection: Any = None
-    out_dir: Any = kwargs.get("out_dir") or kwargs.get("output_dir") or kwargs.get("dest")
+    project = selection = None
+    out_dir = kwargs.get("out_dir") or kwargs.get("output_dir") or kwargs.get("dest")
 
     positional = list(args)
     if len(positional) >= 2:
         project, selection = positional[0], positional[1]
         if len(positional) >= 3 and out_dir is None:
             out_dir = positional[2]
-        # A second string argument is ambiguous: it may be the file selection or
-        # an output directory. An existing directory is treated as the latter.
+        # A second string argument is ambiguous; an existing directory is an
+        # output directory, anything else is the file selection.
         if isinstance(selection, (str, Path)) and Path(selection).is_dir():
-            log.info("Second argument %r is a directory; using it as the output "
-                     "directory.", str(selection))
-            out_dir, selection = selection, project
-            project = None
+            out_dir, selection, project = selection, project, None
     elif positional:
         selection = positional[0]
 
@@ -2825,15 +2107,9 @@ def document_generate(*args: Any, **kwargs: Any) -> ReportStream:
             selection = kwargs[key]
 
     if selection is None:
-        raise TypeError(
-            "document_generate() needs the export file(s) to analyse. Pass them "
-            "positionally after the project name, or as file_name_selection=..."
-        )
+        raise TypeError("document_generate() needs the export file(s) to analyse.")
 
-    if isinstance(selection, (str, Path)):
-        selection = [selection]
-    else:
-        selection = list(selection)
+    selection = [selection] if isinstance(selection, (str, Path)) else list(selection)
     if not selection:
         raise ValueError("document_generate() was given an empty file selection.")
 
@@ -2841,7 +2117,6 @@ def document_generate(*args: Any, **kwargs: Any) -> ReportStream:
     inputs = [_resolve_export_path(name, project) for name in selection]
     log.info("Generating from %s export(s)%s.", len(inputs),
              f" in project {project}" if project else "")
-
     return ReportStream(generate(inputs, out_dir or DEFAULT_OUTPUT_DIR))
 
 
@@ -2849,42 +2124,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate a workflow analysis report from DataStage XML exports."
-    )
-    parser.add_argument("inputs", nargs="+", help="One or more DataStage XML export files.")
-    parser.add_argument("-o", "--out-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory.")
-    parser.add_argument("-t", "--template", default=None, help="Path to temp.docx.")
-    parser.add_argument("--no-llm", action="store_true",
-                        help="Skip narrative generation; produce tables only.")
-    parser.add_argument("--keep-docx", action="store_true",
-                        help="Keep the intermediate Word document.")
+        description="Generate a workflow analysis report from DataStage XML exports.")
+    parser.add_argument("inputs", nargs="+")
+    parser.add_argument("-o", "--out-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--no-llm", action="store_true", help="Tables only, no descriptions.")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s  %(message)s",
-    )
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s  %(message)s")
 
-    global TEMPLATE_DOCX_PATH, LLM_ENABLED, KEEP_INTERMEDIATE_DOCX
-    if args.template:
-        TEMPLATE_DOCX_PATH = args.template
+    global LLM_ENABLED
     if args.no_llm:
         LLM_ENABLED = False
-    if args.keep_docx:
-        KEEP_INTERMEDIATE_DOCX = True
-
-    if not Path(TEMPLATE_DOCX_PATH).is_file():
-        log.error("Template not found: %s", TEMPLATE_DOCX_PATH)
-        return 1
 
     try:
-        result = generate(args.inputs, args.out_dir)
-    except RuntimeError as exc:
+        print(generate(args.inputs, args.out_dir))
+    except (RuntimeError, FileNotFoundError) as exc:
         log.error("%s", exc)
         return 1
-
-    print(result)
     return 0
 
 
