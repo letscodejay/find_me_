@@ -1,27 +1,26 @@
 """
 diagnose.py
 ===========
-Run this once on the Windows laptop, from the DataStage_to_SQL folder:
+Reads every DataStage export under INPUTS/analyzer_INPUTS, runs the parser over
+each one, and prints what the report generator needs in order to handle them.
 
     python diagnose.py
+    python diagnose.py --dir "some\\other\\folder"
+    python diagnose.py --full          also dumps every property name it saw
 
-It checks the environment, finds your DataStage exports, parses a real one, and
-tries a full DOCX to PDF conversion. It prints a short summary that fits on one
-screen, and writes the long version to diagnose_report.txt.
+Nothing is modified. No credentials and no data values are printed - only
+structural names: record types, stage types, property names and link shapes.
 
-Nothing is modified. No API keys, endpoints or file contents are printed.
-
-Options:
-    python diagnose.py --xml "path\\to\\export.xml"    parse a specific export
-    python diagnose.py --template "path\\to\\temp.docx"
+The long version is written to diagnose_report.txt.
 """
 
 from __future__ import annotations
 
-import os
 import sys
-import tempfile
+from collections import Counter
 from pathlib import Path
+
+DEFAULT_DIR = "INPUTS/analyzer_INPUTS"
 
 LINES: list[str] = []
 DETAIL: list[str] = []
@@ -36,437 +35,238 @@ def detail(text: str) -> None:
     DETAIL.append(text)
 
 
-def head(n: int, title: str) -> None:
+def head(title: str) -> None:
     out("")
-    out("=" * 64)
-    out(f" {n}  {title}")
-    out("=" * 64)
+    out("=" * 74)
+    out(f" {title}")
+    out("=" * 74)
 
 
-def row(label: str, value: str) -> None:
-    if len(label) > 15:
-        out(f" {label}")
-        out(f" {'':<16}{value}")
-    else:
-        out(f" {label:<16}{value}")
+def wrap(label: str, items, width: int = 56) -> None:
+    """Print a long list across several lines, keeping the label column clean."""
+    line, first = "", True
+    for item in items:
+        if len(line) + len(item) + 2 > width:
+            out(f" {label if first else '':<15}{line.rstrip(', ')}")
+            line, first = "", False
+        line += f"{item}, "
+    if line:
+        out(f" {label if first else '':<15}{line.rstrip(', ')}")
 
 
-def short(path) -> str:
-    try:
-        return str(Path(path).resolve().relative_to(Path.cwd()))
-    except Exception:
-        return str(path)
-
-
-# ---------------------------------------------------------------- 1 environment
-
-def section_environment() -> None:
-    head(1, "ENVIRONMENT")
-    v = sys.version_info
-    row("python", f"{v.major}.{v.minor}.{v.micro}   platform: {sys.platform}")
-    row("cwd", short(Path.cwd()))
-    row("in venv", "yes" if sys.prefix != sys.base_prefix else "NO")
-
-    import importlib
-    import importlib.metadata as md
-
-    got = []
-    for module, dist in [("docx", "python-docx"), ("lxml", "lxml"),
-                         ("docx2pdf", "docx2pdf"), ("win32com.client", "pywin32"),
-                         ("crewai", "crewai"), ("langchain_openai", "langchain-openai"),
-                         ("flask", "flask")]:
-        try:
-            importlib.import_module(module)
-            try:
-                got.append(f"{dist} {md.version(dist)}")
-            except Exception:
-                got.append(f"{dist} ok")
-        except Exception:
-            got.append(f"{dist} MISSING")
-    for i in range(0, len(got), 2):
-        row("packages" if i == 0 else "", "   ".join(f"{g:<28}" for g in got[i:i + 2]).rstrip())
-
-
-def section_word() -> None:
-    head(2, "WORD AND FONTS")
-    if sys.platform != "win32":
-        row("skipped", f"not Windows ({sys.platform})")
-        return
-
-    try:
-        import ctypes
-        pid = ctypes.windll.kernel32.GetCurrentProcessId()
-        sess = ctypes.c_ulong()
-        ctypes.windll.kernel32.ProcessIdToSessionId(pid, ctypes.byref(sess))
-        row("session", f"{sess.value}" + ("  (session 0 - Word COM will fail)"
-                                          if sess.value == 0 else "  interactive"))
-    except Exception as exc:
-        row("session", f"unknown ({exc})")
-
-    try:
-        import pythoncom
-        import win32com.client
-        pythoncom.CoInitialize()
-        word = None
-        try:
-            word = win32com.client.DispatchEx("Word.Application")
-            word.Visible = False
-            row("word com", f"OK   version {word.Version}")
-        finally:
-            if word is not None:
-                try:
-                    word.Quit()
-                except Exception:
-                    pass
-            pythoncom.CoUninitialize()
-    except Exception as exc:
-        row("word com", f"FAILED  {type(exc).__name__}: {str(exc)[:80]}")
-        detail(f"Word COM error: {exc!r}")
-
-    fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-    marks = []
-    for name, f in (("Arial", "arial.ttf"), ("Georgia", "georgia.ttf"),
-                    ("Consolas", "consola.ttf")):
-        marks.append(f"{name} {'ok' if (fonts_dir / f).exists() else 'MISSING'}")
-    row("fonts", "   ".join(marks))
-
-    try:
-        import subprocess
-        rule = "D4F940AB-401B-4EFC-AADC-AD5F3C50688A"
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "$p=Get-MpPreference; for($i=0;$i -lt $p.AttackSurfaceReductionRules_Ids.Count;$i++)"
-             "{'{0}={1}' -f $p.AttackSurfaceReductionRules_Ids[$i],$p.AttackSurfaceReductionRules_Actions[$i]}"],
-            capture_output=True, text=True, timeout=60)
-        rules = {k.strip().upper(): v.strip()
-                 for k, v in (l.split("=", 1) for l in res.stdout.splitlines() if "=" in l)}
-        action = rules.get(rule)
-        row("defender asr", {"1": "BLOCKING office child processes",
-                             "2": "audit only", "6": "warn only"}.get(action, "not blocking"))
-    except Exception:
-        row("defender asr", "could not read policy")
-
-
-# ------------------------------------------------------------------- 3 template
-
-def section_template(template_arg: str | None) -> None:
-    head(3, "TEMPLATE")
-    candidates = [template_arg] if template_arg else []
-    try:
-        sys.path.insert(0, str(Path.cwd()))
-        from Backend.Analyzer import generate_doc as gd          # type: ignore
-        candidates.append(gd.TEMPLATE_DOCX_PATH)
-    except Exception:
-        pass
-    candidates += ["temp.docx", "Backend/Analyzer/temp.docx", "templates/temp.docx"]
-    candidates += [str(p) for p in Path.cwd().rglob("temp.docx")][:3]
-
-    path = next((Path(c) for c in candidates if c and Path(c).is_file()), None)
-    if path is None:
-        row("template", "NOT FOUND")
-        row("looked in", ", ".join(short(c) for c in candidates if c)[:200])
-        return
-
-    row("template", f"{short(path)}   {path.stat().st_size:,} bytes")
-    try:
-        with open(f"{path}:Zone.Identifier", "r"):
-            row("blocked", "YES - marked as downloaded, Word opens it in Protected View")
-    except (OSError, ValueError):
-        row("blocked", "no")
-
-    try:
-        from docx import Document
-        doc = Document(str(path))
-        sec = doc.sections[0]
-        hdr = sec.header.paragraphs[0].text.strip()
-        breaks = sum(p._element.xml.count('w:type="page"') for p in doc.paragraphs)
-        row("header", repr(hdr)[:60] if hdr else "(none - report pages get no header)")
-        row("paragraphs", f"{len(doc.paragraphs)}   page breaks: {breaks}")
-        row("page", f"{sec.page_width.inches:.2f} x {sec.page_height.inches:.2f} in   "
-                    f"margins L{sec.left_margin.inches:.2f} R{sec.right_margin.inches:.2f}")
-        row("usable width", f"{sec.page_width.inches - sec.left_margin.inches - sec.right_margin.inches:.2f} in")
-    except Exception as exc:
-        row("open", f"FAILED  {exc}")
-
-
-# --------------------------------------------------------------- 4 project files
-
-def section_layout(xml_arg: str | None) -> Path | None:
-    head(4, "PROJECT LAYOUT")
-    root = Path.cwd()
-    skip = {".git", "env", "venv", ".venv", "node_modules", "__pycache__", "site-packages"}
-    found: list[Path] = []
-    for p in root.rglob("*.xml"):
-        if any(part in skip for part in p.parts):
-            continue
-        found.append(p)
-        if len(found) >= 400:
-            break
-
-    row("xml files", str(len(found)))
-    folders: dict[str, int] = {}
-    for p in found:
-        key = short(p.parent)
-        folders[key] = folders.get(key, 0) + 1
-    for folder, count in sorted(folders.items(), key=lambda kv: -kv[1])[:8]:
-        row("", f"{count:>4}  {folder}")
-        detail(f"folder {folder}: {count} xml")
-
-    for name in ("uploads", "data", "projects", "Backend/uploads", "static/uploads"):
-        if (root / name).is_dir():
-            row("dir exists", name)
-
-    if xml_arg and Path(xml_arg).is_file():
-        return Path(xml_arg)
-    # Prefer something that looks like a DataStage export.
-    for p in found:
-        try:
-            head_text = p.open("r", encoding="utf-8", errors="ignore").read(4000)
-        except Exception:
-            continue
-        if "DSExport" in head_text or "<Job " in head_text or "DSJob" in head_text:
-            return p
-    return found[0] if found else None
-
-
-# ---------------------------------------------------------------- 5 route wiring
-
-def section_route() -> None:
-    head(5, "ROUTE WIRING")
-    candidates = list(Path.cwd().rglob("analyzer.py"))
-    target = next((p for p in candidates if "routes" in p.parts), None)
-    if target is None:
-        row("analyzer.py", "not found")
-        return
-    row("file", short(target))
-    try:
-        text = target.read_text(encoding="utf-8", errors="ignore")
-    except Exception as exc:
-        row("read", f"failed: {exc}")
-        return
-    # Report which helpers are referenced, not the source itself.
-    markers = ["send_file", "send_from_directory", "make_response", "Response",
-               "download_name", "attachment_filename", "as_attachment",
-               "mimetype", "BytesIO", "document_generate", ".read(", "open("]
-    present = [m for m in markers if m in text]
-    row("uses", ", ".join(present) if present else "(none of the usual helpers)")
-    for line in text.splitlines():
-        if "document_generate(" in line and "import" not in line:
-            row("call", line.strip()[:70])
-            break
-
-
-def _stub_missing_modules() -> list[str]:
-    """
-    Insert placeholder modules for anything generate_doc imports at module level
-    but that is not installed here. Only genuinely missing names are stubbed;
-    real packages are left alone.
-    """
+def load_parser():
+    """Import generate_doc, stubbing anything unrelated that is missing."""
     import importlib
     import types
 
-    stubbed: list[str] = []
-    plan = {
+    for name, attrs in {
         "crewai": ("Agent", "Crew", "Process", "Task"),
         "langchain_openai": ("AzureChatOpenAI",),
         "docx2pdf": ("convert",),
         "pythoncom": (),
         "win32com": (),
         "win32com.client": (),
-    }
-    for name, attrs in plan.items():
+    }.items():
         try:
             importlib.import_module(name)
-            continue
         except Exception:
-            pass
-        module = types.ModuleType(name)
-        for attr in attrs:
-            setattr(module, attr, object)
-        sys.modules[name] = module
-        stubbed.append(name)
+            module = types.ModuleType(name)
+            for attr in attrs:
+                setattr(module, attr, object)
+            sys.modules[name] = module
     if "win32com" in sys.modules and "win32com.client" in sys.modules:
-        sys.modules["win32com"].client = sys.modules["win32com.client"]   # type: ignore
-    return stubbed
+        sys.modules["win32com"].client = sys.modules["win32com.client"]
 
-
-# ------------------------------------------------------------- 6 real parse test
-
-def section_parse(xml_path: Path | None) -> None:
-    head(6, "REAL EXPORT PARSE")
-    if xml_path is None:
-        row("export", "no XML file found - pass one with --xml")
-        return
-    row("export", f"{short(xml_path)}   {xml_path.stat().st_size:,} bytes")
-
+    sys.path.insert(0, str(Path.cwd()))
     try:
-        from lxml import etree
-        tree = etree.parse(str(xml_path), etree.XMLParser(recover=True, huge_tree=True))
-        root = tree.getroot()
-    except Exception as exc:
-        row("xml", f"UNPARSEABLE  {exc}")
-        return
-
-    def tag(el) -> str:
-        return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
-
-    row("root element", f"<{tag(root)}>")
-    jobs = [e for e in root.iter() if tag(e) == "Job"]
-    row("job elements", str(len(jobs)))
-    if jobs:
-        j = jobs[0]
-        row("job attrs", ", ".join(f"{k}={str(v)[:18]}" for k, v in list(j.attrib.items())[:4]))
-
-    records = [e for e in root.iter() if tag(e) == "Record"]
-    row("record count", str(len(records)))
-
-    types: dict[str, int] = {}
-    for r in records:
-        types[r.get("Type") or "(none)"] = types.get(r.get("Type") or "(none)", 0) + 1
-    ordered = sorted(types.items(), key=lambda kv: -kv[1])
-    for i in range(0, min(len(ordered), 12), 3):
-        row("record types" if i == 0 else "",
-            "  ".join(f"{k} {v}" for k, v in ordered[i:i + 3]))
-    detail("all record types: " + repr(types))
-
-    # Which property names actually carry the name, the type and the link partner.
-    prop_names: dict[str, int] = {}
-    for r in records:
-        for p in r:
-            if tag(p) == "Property" and p.get("Name"):
-                prop_names[p.get("Name")] = prop_names.get(p.get("Name"), 0) + 1
-    top = sorted(prop_names.items(), key=lambda kv: -kv[1])[:15]
-    row("top properties", ", ".join(k for k, _ in top[:8]))
-    detail("property histogram: " + repr(sorted(prop_names.items(), key=lambda kv: -kv[1])[:60]))
-
-    for wanted in ("Name", "StageType", "Partner"):
-        row(f"has '{wanted}'", f"{prop_names.get(wanted, 0)} records" if wanted in prop_names
-            else "NOT PRESENT  <-- parser assumption to revisit")
-
-    ids = [r.get("Identifier") for r in records if r.get("Identifier")][:6]
-    row("identifiers", ", ".join(ids))
-
-    # Now the parser itself. Unrelated packages are stubbed if absent, so a
-    # missing crewai or pywin32 does not hide the parser result - which is the
-    # part of this report that matters most.
-    out("")
-    try:
-        sys.path.insert(0, str(Path.cwd()))
-        stubbed = _stub_missing_modules()
-        if stubbed:
-            row("note", "stubbed for this test: " + ", ".join(stubbed))
-        try:
-            from Backend.Analyzer import generate_doc as G      # type: ignore
-        except Exception:
-            import generate_doc as G                            # type: ignore
-        G.LLM_ENABLED = False
-        parsed = G.DataStageParser(xml_path).parse_all_jobs()
-        row("PARSER jobs", str(len(parsed)))
-        for job in parsed[:2]:
-            g = G.analyze(job)
-            row("  job", job.job_name[:40])
-            row("  stages", f"{len(g.stages)}   links {len(g.links)}")
-            row("  roles", f"src {len(g.sources)}  ref {len(g.references)}  "
-                           f"xfm {len(g.transformations)}  tgt {len(g.targets)}  "
-                           f"unclassified {len(g.data_objects)}")
-            row("  paths", f"{len(g.paths)}  truncated {g.paths_truncated}  cycles {g.has_cycles}")
-            row("  warnings", str(len(job.warnings)))
-            for w in job.warnings[:2]:
-                row("", w[:66])
-            for s in g.stages[:4]:
-                row("", f"{s.identifier:<8} {s.display_name[:22]:<24} "
-                        f"{s.display_type[:16]:<18} {s.role}")
-            detail(f"job {job.job_name}: " + repr([
-                (s.identifier, s.name, s.stage_type, s.role, len(s.inputs), len(s.outputs))
-                for s in g.stages]))
-    except Exception as exc:
-        import traceback
-        row("PARSER", f"FAILED  {type(exc).__name__}: {str(exc)[:60]}")
-        detail("parser traceback:\n" + traceback.format_exc())
+        from Backend.Analyzer import generate_doc as G      # type: ignore
+    except Exception:
+        import generate_doc as G                            # type: ignore
+    G.LLM_ENABLED = False
+    return G
 
 
-# --------------------------------------------------------------- 7 conversion
-
-def section_conversion() -> None:
-    head(7, "DOCX TO PDF")
-    if sys.platform != "win32":
-        row("skipped", "not Windows")
-        return
-    try:
-        import pythoncom
-        from docx import Document
-        from docx2pdf import convert
-    except Exception as exc:
-        row("skipped", f"{exc}")
-        return
-    with tempfile.TemporaryDirectory(prefix="diag_") as tmp:
-        d = Path(tmp) / "probe.docx"
-        pdf = Path(tmp) / "probe.pdf"
-        doc = Document()
-        doc.add_paragraph("conversion probe")
-        doc.save(str(d))
-        pythoncom.CoInitialize()
-        try:
-            convert(str(d), str(pdf))
-            row("result", f"OK   {pdf.stat().st_size:,} bytes" if pdf.is_file()
-                else "Word ran but produced no PDF")
-        except Exception as exc:
-            row("result", f"FAILED  {type(exc).__name__}: {str(exc)[:70]}")
-            detail(f"conversion error: {exc!r}")
-        finally:
-            pythoncom.CoUninitialize()
-
-
-# ------------------------------------------------------------------- 8 azure
-
-def section_azure() -> None:
-    head(8, "AZURE (values are never printed)")
-    names = ("AZURE_OPENAI_DEPLOYMENT", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY",
-             "AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION",
-             "HTTPS_PROXY", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
-    marks = [f"{n.replace('AZURE_OPENAI_', '').replace('_', '')[:11]}"
-             f"={'set' if os.environ.get(n) else '-'}" for n in names]
-    for i in range(0, len(marks), 4):
-        row("env vars" if i == 0 else "", "  ".join(f"{m:<16}" for m in marks[i:i + 4]).rstrip())
+def tag(el) -> str:
+    return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
 
 
 def main() -> int:
     import argparse
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--xml", default=None)
-    ap.add_argument("--template", default=None)
+    ap.add_argument("--dir", default=DEFAULT_DIR)
+    ap.add_argument("--full", action="store_true")
     args = ap.parse_args()
 
-    out("DIAGNOSTIC REPORT")
-    xml: Path | None = Path(args.xml) if args.xml and Path(args.xml).is_file() else None
+    folder = Path(args.dir)
+    if not folder.is_dir():
+        found = [p for p in Path.cwd().rglob("analyzer_INPUTS") if p.is_dir()]
+        folder = found[0] if found else Path(".")
+    files = sorted(p for p in folder.rglob("*.xml"))
 
-    def layout_step() -> None:
-        nonlocal xml
-        xml = section_layout(args.xml)
+    out("DATASTAGE EXPORT DIAGNOSTIC")
+    out(f" folder   {folder}")
+    out(f" files    {len(files)}")
+    if not files:
+        out(" No .xml files found. Pass --dir with the right folder.")
+        return 1
 
-    for label, fn in (
-        ("environment", lambda: section_environment()),
-        ("word", lambda: section_word()),
-        ("template", lambda: section_template(args.template)),
-        ("layout", layout_step),
-        ("route", lambda: section_route()),
-        ("parse", lambda: section_parse(xml)),
-        ("conversion", lambda: section_conversion()),
-        ("azure", lambda: section_azure()),
-    ):
+    G = load_parser()
+    from lxml import etree
+
+    record_types: Counter = Counter()
+    stage_types: Counter = Counter()
+    prop_names: Counter = Counter()
+    collections: Counter = Counter()
+    partner_shapes: Counter = Counter()
+    link_type_values: Counter = Counter()
+    props_by_role: dict[str, set] = {}
+    object_report: list[tuple] = []
+    problems: list[str] = []
+
+    # ---------------------------------------------------------------- per file
+    head("PER FILE")
+    out(f" {'file':<30}{'job':>4}{'rec':>5}{'stg':>5}{'lnk':>5}"
+        f"{'src':>4}{'ref':>4}{'xfm':>4}{'tgt':>4}{'unc':>4}{'path':>5}{'warn':>5}")
+    out(" " + "-" * 72)
+
+    for path in files:
+        name = path.name[:29]
         try:
-            fn()
+            root = etree.parse(str(path), etree.XMLParser(recover=True, huge_tree=True)).getroot()
         except Exception as exc:
-            import traceback
-            out(f" ERROR in {label}: {type(exc).__name__}: {exc}")
-            detail(f"{label} traceback:\n" + traceback.format_exc())
+            out(f" {name:<30} UNPARSEABLE  {exc}")
+            problems.append(f"{path.name}: unparseable ({exc})")
+            continue
+
+        for rec in root.iter():
+            if tag(rec) != "Record":
+                continue
+            record_types[rec.get("Type") or "(none)"] += 1
+            for child in rec:
+                t = tag(child)
+                if t == "Property" and child.get("Name"):
+                    key = child.get("Name")
+                    prop_names[key] += 1
+                    if key == "StageType":
+                        stage_types["".join(child.itertext()).strip()] += 1
+                    elif key in ("Partner", "PartnerLink", "LinkPartner"):
+                        raw = "".join(child.itertext()).strip()
+                        partner_shapes["pipe" if "|" in raw else "plain"] += 1
+                    elif key == "LinkType":
+                        link_type_values["".join(child.itertext()).strip()] += 1
+                elif t == "Collection" and child.get("Name"):
+                    collections[child.get("Name")] += 1
+
+        try:
+            jobs = G.DataStageParser(path).parse_all_jobs()
+        except Exception as exc:
+            out(f" {name:<30} PARSER FAILED  {type(exc).__name__}: {exc}")
+            problems.append(f"{path.name}: parser failed ({exc})")
+            continue
+
+        recs = sum(len(j.all_records) for j in jobs)
+        for job in jobs:
+            g = G.analyze(job)
+            out(f" {name:<30}{len(jobs):>4}{len(job.all_records):>5}{len(g.stages):>5}"
+                f"{len(g.links):>5}{len(g.sources):>4}{len(g.references):>4}"
+                f"{len(g.transformations):>4}{len(g.targets):>4}{len(g.data_objects):>4}"
+                f"{len(g.paths):>5}{len(job.warnings):>5}")
+            name = ""    # only label the first job of a multi-job file
+
+            if g.stages and not g.links:
+                problems.append(f"{path.name}: {len(g.stages)} stages but NO links resolved")
+            if g.data_objects:
+                problems.append(
+                    f"{path.name}: {len(g.data_objects)} stage(s) unclassified "
+                    f"({', '.join(s.display_name for s in g.data_objects[:3])})")
+            for w in job.warnings[:3]:
+                detail(f"{path.name} warning: {w}")
+
+            for stage in g.stages:
+                props_by_role.setdefault(stage.role, set()).update(
+                    k for k, v in stage.properties.items() if v)
+            for stage in g.sources + g.targets:
+                if len(object_report) < 8:
+                    blobs = [(k, len(v)) for k, v in stage.properties.items()
+                             if v and v.lstrip().startswith("<")]
+                    object_report.append(
+                        (stage.display_name, stage.display_type, stage.role,
+                         G.stage_object(stage),
+                         sorted(k for k, v in stage.properties.items() if v),
+                         blobs, stage.properties))
+
+    # ------------------------------------------------------------- aggregates
+    head("RECORD TYPES ACROSS ALL FILES")
+    handled = (G.RECORD_TYPES_JOB | G.RECORD_TYPES_STAGE | G.RECORD_TYPES_INPUT
+               | G.RECORD_TYPES_OUTPUT | G.RECORD_TYPES_ANNOTATION
+               | G.RECORD_TYPES_IGNORED)
+    wrap("handled", [f"{k} {v}" for k, v in record_types.most_common() if k in handled])
+    unknown = [f"{k} {v}" for k, v in record_types.most_common() if k not in handled]
+    if unknown:
+        out(" NOT HANDLED - these records are ignored by the parser:")
+        wrap("", unknown)
+        problems.append(f"unhandled record types: {', '.join(u.split()[0] for u in unknown)}")
+    else:
+        out(" every record type is handled")
+
+    head("STAGE TYPES ACROSS ALL FILES")
+    wrap("types", [f"{k} {v}" for k, v in stage_types.most_common(24)])
+    lookups = [k for k in stage_types if any(h in k.lower() for h in G.REFERENCE_CONSUMER_HINTS)]
+    out(f" treated as reference consumers: {', '.join(lookups) or 'none'}")
+    joins = [k for k in stage_types if "join" in k.lower() or "merge" in k.lower()]
+    if joins:
+        out(f" join/merge present (secondary input is data, not reference): {', '.join(joins)}")
+
+    head("LINKS")
+    out(f" Partner format   pipe 'stage|port': {partner_shapes['pipe']}   "
+        f"plain 'port': {partner_shapes['plain']}")
+    out(f" LinkType property values: "
+        f"{dict(link_type_values) if link_type_values else 'property not present'}")
+    if not link_type_values:
+        out("   -> reference links are detected from the port index on a lookup stage")
+
+    head("OBJECT COLUMN - where the table or file name lives")
+    for nm, ty, role, resolved, keys, blobs, allprops in object_report:
+        out(f" {nm[:30]:<31}{ty[:18]:<19}{role}")
+        out(f"   resolved -> {resolved if resolved else 'NOT FOUND'}")
+        wrap("   props", keys[:14] if not blobs else keys[:10], width=54)
+        for bk, blen in blobs:
+            out(f"   xml blob '{bk}' ({blen} chars), tags inside:")
+            try:
+                sub = etree.fromstring(allprops[bk].encode("utf-8", "ignore"),
+                                       etree.XMLParser(recover=True))
+                tags = []
+                for el in sub.iter():
+                    t = tag(el)
+                    if t and t not in tags:
+                        tags.append(t)
+                wrap("     ", tags[:26], width=52)
+            except Exception as exc:
+                out(f"     could not parse blob: {exc}")
+        detail(f"{nm} all properties: {sorted(allprops)}")
+
+    head("PROPERTY NAMES BY ROLE")
+    for role in ("source", "reference", "transformation", "target", "unclassified"):
+        if role in props_by_role:
+            wrap(role, sorted(props_by_role[role])[: (60 if args.full else 14)])
+
+    if collections:
+        head("COLLECTIONS (column and schema data)")
+        wrap("names", [f"{k} {v}" for k, v in collections.most_common(14)])
+
+    head("PROBLEMS")
+    if problems:
+        for p in dict.fromkeys(problems):
+            out(f" - {p}")
+    else:
+        out(" none")
 
     out("")
-    out("=" * 64)
-    report = Path("diagnose_report.txt")
-    report.write_text("\n".join(LINES) + "\n\nDETAIL\n" + "\n".join(DETAIL), encoding="utf-8")
-    out(f" Long version written to {report.resolve().name}")
-    out(" Photograph the sections above. Send diagnose_report.txt if asked.")
+    out("=" * 74)
+    Path("diagnose_report.txt").write_text(
+        "\n".join(LINES) + "\n\nDETAIL\n" + "\n".join(DETAIL), encoding="utf-8")
+    out(" Long version in diagnose_report.txt")
     return 0
 
 
