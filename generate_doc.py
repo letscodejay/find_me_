@@ -58,22 +58,16 @@ log = logging.getLogger("generate_doc")
 # =============================================================================
 # SECTION A   VISUAL FORMATTING TUNABLES
 # =============================================================================
-# Everything that controls how the report *looks* lives in this block. The
-# template (see TEMPLATE_DOCX_PATH) is a plain Word document; the builder
-# overrides its default styles with the values below so the output matches the
-# approved draft rather than Word's defaults.
+# Everything controlling how the report looks. The builder overrides the
+# template's own styles with these.
 
 # --- Template -----------------------------------------------------------------
 # Path to temp.docx. Page 1 is the cover and is left untouched; the report is
 # appended from page 2 onward.
 TEMPLATE_DOCX_PATH = r"temp.docx"
 
-# Whether to insert a page break before the report starts.
-#   "auto"  detect whether temp.docx already ends on a page break (recommended)
-#   True    always insert one - use when the template is cover text with no break
-#   False   never insert one - use when the template already ends on a break
-# Getting this wrong is silent: too many breaks leave a blank page between the
-# cover and the contents, too few start the contents on the cover itself.
+# "auto" detects whether temp.docx already ends on a page break. Getting this
+# wrong is silent: a blank page 2, or the contents landing on the cover.
 INSERT_PAGE_BREAK_AFTER_TEMPLATE = "auto"
 
 # Delete any empty trailing paragraphs the template leaves behind before writing.
@@ -85,11 +79,10 @@ TRIM_TEMPLATE_TRAILING_EMPTY_PARAGRAPHS = True
 COLLAPSE_EXTRA_TEMPLATE_PAGE_BREAKS = True
 
 # --- Page ---------------------------------------------------------------------
-# The template's own page size is kept by default. Table widths are measured
-# from the real section width at build time, so the layout fits whatever size
-# temp.docx uses - A4 or Letter - without editing anything here.
-# Both default off so the template's cover page is not shifted - page geometry
-# belongs to temp.docx. Table widths adapt to whatever it uses.
+# Table widths are measured from the real page at build time, so A4 and Letter
+# both fit without changes here.
+# Off by default: page geometry belongs to temp.docx, and forcing margins would
+# shift its cover page too.
 FORCE_PAGE_SIZE = False
 PAGE_WIDTH_IN = 8.27          # only used when FORCE_PAGE_SIZE is True
 PAGE_HEIGHT_IN = 11.69
@@ -133,6 +126,8 @@ SIZE_RUNNING = 7.5             # header / footer
 SIZE_TOC = 9.5
 
 # --- Spacing (points) ---------------------------------------------------------
+SECTION_STARTS_NEW_PAGE = True      # every section begins on a fresh page
+SKIP_EMPTY_SECTIONS = True          # a section with no rows is left out entirely
 SPACE_BEFORE_SECTION = 16.0
 SPACE_AFTER_SECTION_TITLE = 7.0
 SPACE_AFTER_TABLE = 4.0
@@ -160,14 +155,10 @@ UPPERCASE_SECTION_NUMBER = True
 SECTION_NUMBER_SPACING_TWIPS = 30   # letter-spacing on the eyebrow
 
 # --- Running header / footer --------------------------------------------------
-# "template"  the header and footer in temp.docx are left exactly as they are and
-#             appear on every page. Nothing below overwrites them.
-# "generate"  build a running header and footer from the settings below instead.
+# "template" keeps whatever temp.docx defines; "generate" builds its own.
 HEADER_FOOTER_MODE = "template"
 
-# In template mode, add a page number only if the template footer has none - a
-# multi-page report with no page numbers is hard to refer to. Set False to leave
-# the footer completely untouched.
+# Adds a page number only when the template footer has none.
 ADD_PAGE_NUMBER_IF_TEMPLATE_HAS_NONE = True
 
 # Used only when HEADER_FOOTER_MODE == "generate".
@@ -177,18 +168,17 @@ RUNNING_HEADER_LEFT = "Workflow Analysis Report"   # right side shows the job na
 FOOTER_PAGE_FORMAT = "Page {page} of {total}"      # rendered as live Word fields
 
 # --- Content limits -----------------------------------------------------------
-# The model writes variable-length text and the export carries names of any
-# length. These caps keep the layout identical regardless of what arrives.
+# The model writes variable-length text and names can be any length. These caps
+# keep the layout the same whatever arrives.
 MAX_DESCRIPTION_CHARS = 340         # per table cell; trimmed at a sentence end
 MAX_PATH_CELL_CHARS = 260           # a very long path chain in Section 8
 MAX_PROSE_PARAGRAPHS = 3            # Section 3 and the Section 8 summary
 MAX_PROSE_CHARS = 1500
-LONG_TOKEN_BREAK_AFTER = 16         # give Word a break point inside long identifiers
+LONG_TOKEN_BREAK_AFTER = 28         # only split a run with no separator once it is this long
 TRUNCATION_MARK = "…"
 
-# Diagram: Consolas at SIZE_DIAGRAM fits about 100 characters across the page.
-# Wider diagrams shrink until they fit, then fall back to the derived layout.
-MAX_DIAGRAM_LINES = 26
+# A wider diagram shrinks until it fits, then falls back.
+MAX_DIAGRAM_LINES = 90
 DIAGRAM_MIN_FONT = 6.0
 MONO_CHAR_WIDTH_RATIO = 0.55        # Consolas advance width as a fraction of the em
 
@@ -197,20 +187,8 @@ TEXT_NOT_IDENTIFIED = "Not identified from file"
 TEXT_NOT_APPLICABLE = "Not applicable"
 
 # --- Report wording -----------------------------------------------------------
-REPORT_TITLE = "Workflow Analysis Report"
 CONTENTS_HEADING = "Contents"
 CONTENTS_EYEBROW = "Table of"
-SECTION_TITLES = {
-    1: "Workflow Overview",
-    2: "Workflow Stages",
-    3: "Workflow Architecture",
-    4: "Sources",
-    5: "Transformations",
-    6: "References",
-    7: "Targets",
-    8: "Data Path",
-    9: "Observations",
-}
 
 # --- LLM ----------------------------------------------------------------------
 LLM_ENABLED = True                  # False -> tables only, no descriptive prose
@@ -260,29 +238,31 @@ PROJECT_FILE_SEARCH_DEPTH = 4          # how deep to search a root as a last res
 
 # --- Conversion ---------------------------------------------------------------
 KEEP_INTERMEDIATE_DOCX = False      # True leaves the .docx next to the .pdf
-PDF_CONVERSION_TIMEOUT_SECONDS = 300
 
 
 # =============================================================================
 # SECTION B   DATASTAGE PARSER
 # =============================================================================
-# Reads an IBM InfoSphere DataStage XML export into a typed model. This layer
-# does no formatting and no graph reasoning - it only turns XML into objects.
+# XML to a typed model. No formatting, no graph reasoning.
 
-# Record Type values, grouped by what they mean. Kept as data so a new DataStage
-# variant is a one-line change rather than a new branch.
+# Record Type values by meaning. Data, not branches, so a new DataStage variant
+# is a one-line change.
 RECORD_TYPES_JOB = {"DSJob", "JobDefn", "Job"}
 RECORD_TYPES_STAGE = {
-    "CustomStage", "TransformerStage", "Stage", "ContainerStage", "CContainer",
-    "CTrxStage", "ServerStage", "ParallelStage",
+    "CustomStage", "TransformerStage", "HashedFileStage", "Stage",
+    "ContainerStage", "CContainer", "CTrxStage", "ServerStage", "ParallelStage",
 }
-RECORD_TYPES_INPUT = {"CustomInput", "TrxInput", "CTrxInput", "StageInput", "Input"}
-RECORD_TYPES_OUTPUT = {"CustomOutput", "TrxOutput", "CTrxOutput", "StageOutput", "Output"}
+# Input ports are reached through their partner, not walked directly. Listed so
+# diagnose.py can tell handled record types from unhandled ones.
+RECORD_TYPES_INPUT = {
+    "CustomInput", "TrxInput", "HashedInput", "CTrxInput", "StageInput", "Input",
+}
+RECORD_TYPES_OUTPUT = {
+    "CustomOutput", "TrxOutput", "HashedOutput", "CTrxOutput", "StageOutput", "Output",
+}
 RECORD_TYPES_ANNOTATION = {"Annotation", "CAnnotation"}
 
-# Records that describe the export rather than the workflow. StageType records
-# are stage *definitions*, not stages on the canvas, and ContainerView is the
-# designer's view of the job. Listing either in Section 2 would be noise.
+# Definitions and designer views, not workflow objects.
 RECORD_TYPES_IGNORED = {"StageType", "ContainerView", "JobView", "TableDef"}
 
 # Stage types whose secondary inputs are reference data rather than a second
@@ -726,8 +706,7 @@ class DataStageParser:
 # =============================================================================
 # SECTION C   GRAPH ANALYSIS
 # =============================================================================
-# Turns stages and links into the derived facts the report is built from:
-# roles, path enumeration, and the observations recorded in Section 9.
+# Stages and links to derived facts: roles, paths, observations.
 
 ROLE_SOURCE = "source"
 ROLE_REFERENCE = "reference"
@@ -775,17 +754,8 @@ class WorkflowGraph:
     def links(self) -> list[Link]:
         return self.job.links
 
-    def link_between(self, from_id: str, to_id: str) -> Link | None:
-        for l in self.links:
-            if l.from_stage == from_id and l.to_stage == to_id:
-                return l
-        return None
-
     def outgoing(self, stage: Stage) -> list[Link]:
         return [l for l in self.links if l.from_stage == stage.identifier]
-
-    def incoming(self, stage: Stage) -> list[Link]:
-        return [l for l in self.links if l.to_stage == stage.identifier]
 
 
 def analyze(job: ParsedJob) -> WorkflowGraph:
@@ -895,6 +865,69 @@ def _enumerate_paths(
     return paths, truncated, cycles, total
 
 
+def _consistency_problems(job: ParsedJob, graph: WorkflowGraph) -> list[str]:
+    """Cross-check the report's own numbers against the parsed graph.
+
+    These invariants should never fail. If one does, something in the parse or
+    the analysis is wrong, and it is better for the report to say so than to
+    print a confident number nobody can trust.
+    """
+    problems: list[str] = []
+    by_id = {s.identifier: s for s in graph.stages}
+    names = {s.display_name for s in graph.stages}
+
+    if len(by_id) != len(graph.stages):
+        problems.append("Two or more stages share an identifier.")
+
+    classified = (len(graph.sources) + len(graph.references)
+                  + len(graph.transformations) + len(graph.targets))
+    if classified + len(graph.data_objects) != len(graph.stages):
+        problems.append(
+            f"Stage counts disagree: {classified} classified by role plus "
+            f"{len(graph.data_objects)} unclassified is "
+            f"{classified + len(graph.data_objects)}, but Section 2 lists "
+            f"{len(graph.stages)} stages.")
+
+    for link in graph.links:
+        if link.from_stage not in by_id or link.to_stage not in by_id:
+            problems.append(
+                f"Link {link.display_name} connects a stage that Section 2 does not list.")
+            break
+
+    in_deg: dict[str, int] = {i: 0 for i in by_id}
+    out_deg: dict[str, int] = {i: 0 for i in by_id}
+    for link in graph.links:
+        if link.from_stage in out_deg:
+            out_deg[link.from_stage] += 1
+        if link.to_stage in in_deg:
+            in_deg[link.to_stage] += 1
+    for stage in graph.stages:
+        if len(stage.inputs) != in_deg[stage.identifier] or \
+                len(stage.outputs) != out_deg[stage.identifier]:
+            problems.append(
+                f"The link counts shown for {stage.display_name} do not match the links "
+                "listed in Section 3.")
+            break
+
+    for stage in graph.sources + graph.references:
+        if in_deg[stage.identifier]:
+            problems.append(f"{stage.display_name} is listed as an input but has incoming links.")
+            break
+    for stage in graph.targets:
+        if out_deg[stage.identifier]:
+            problems.append(f"{stage.display_name} is listed as a target but has outgoing links.")
+            break
+
+    for path in graph.paths:
+        unknown = [n for n in path if n not in names]
+        if unknown:
+            problems.append(
+                f"A path in Section 8 names {unknown[0]}, which Section 2 does not list.")
+            break
+
+    return problems
+
+
 def _build_observations(job: ParsedJob, graph: WorkflowGraph) -> list[Observation]:
     """Section 9. Records both exceptions and the fact that checks were run."""
     obs: list[Observation] = []
@@ -923,6 +956,10 @@ def _build_observations(job: ParsedJob, graph: WorkflowGraph) -> list[Observatio
                 f"{s.display_name} declares no input or output links and does not participate "
                 "in any data path. It is listed in Section 2 but does not appear in Section 3.",
             )
+
+    for problem in _consistency_problems(job, graph):
+        add("Internal inconsistency", TEXT_NOT_APPLICABLE,
+            problem + " This report should not be relied on until it is resolved.")
 
     if graph.has_cycles:
         add(
@@ -955,9 +992,8 @@ def _build_observations(job: ParsedJob, graph: WorkflowGraph) -> list[Observatio
 # =============================================================================
 # SECTION D   NARRATIVE GENERATION (LLM)
 # =============================================================================
-# The crew writes explanation *around* parsed facts. It is never the source of a
-# value that appears in a table, and the report is generated with tables only if
-# the model is unavailable.
+# The crew explains parsed facts. It never supplies a value that appears in a
+# table, and the report still generates without it.
 
 @dataclass
 class Narrative:
@@ -1038,9 +1074,7 @@ def _interesting_properties(stage: Stage, limit: int = 8) -> dict[str, str]:
     return out
 
 
-# What a source or target reads from or writes to. Flat properties are checked
-# first; modern connector stages (Snowflake, JDBC, ODBC) instead nest their
-# configuration inside an XML blob, so that is searched next.
+# What a source or target reads from or writes to.
 OBJECT_PROPERTY_CANDIDATES = (
     "TableName", "Table_name", "TableNameInput", "Table", "TargetTable",
     "FileName", "Filename", "File", "FilePath", "Path", "Directory",
@@ -1053,6 +1087,11 @@ OBJECT_XML_TAGS = (
     "File", "Path", "Schema", "TargetTable",
 )
 XML_BLOB_PROPERTY_HINTS = ("XMLProperties", "Properties", "StageProperties", "Config")
+# Connector stages keep their configuration in collection rows, usually as
+# name/value pairs.
+OBJECT_COLLECTION_HINTS = ("Properties", "MetaBag", "PropertyList", "StageProperties")
+COLLECTION_KEY_FIELDS = ("Name", "PropertyName", "Key", "Id")
+COLLECTION_VALUE_FIELDS = ("Value", "PropertyValue", "Data", "Text")
 
 
 def stage_object(stage: Stage) -> str | None:
@@ -1061,7 +1100,12 @@ def stage_object(stage: Stage) -> str | None:
     if flat:
         return _tidy_object(flat)
 
-    # Connector stages nest their configuration in an XML string.
+    # Connector stages record their configuration as collection rows.
+    from_collection = _search_collections(stage)
+    if from_collection:
+        return _tidy_object(from_collection)
+
+    # Some record it as an XML string on a property instead.
     for key, value in stage.properties.items():
         if not value or "<" not in value:
             continue
@@ -1072,6 +1116,35 @@ def stage_object(stage: Stage) -> str | None:
         if found:
             return _tidy_object(found)
     return None
+
+
+def _search_collections(stage: Stage) -> str | None:
+    """Look through a stage's collection rows for a table, file or query."""
+    wanted = {c.lower() for c in OBJECT_PROPERTY_CANDIDATES}
+    fallback: str | None = None
+
+    for name, rows in stage.collections.items():
+        if not any(h.lower() in name.lower() for h in OBJECT_COLLECTION_HINTS):
+            continue
+        for row in rows:
+            # Name/value pair rows.
+            key = next((row[f] for f in COLLECTION_KEY_FIELDS if row.get(f)), None)
+            value = next((row[f] for f in COLLECTION_VALUE_FIELDS if row.get(f)), None)
+            if key and value and key.lower() in wanted:
+                return value
+            if key and value and "<" in value:
+                found = _search_xml_blob(value)
+                if found:
+                    return found
+            # Rows that carry the property directly as a field.
+            for field, field_value in row.items():
+                if not field_value:
+                    continue
+                if field.lower() in wanted:
+                    return field_value
+                if "<" in field_value and fallback is None:
+                    fallback = _search_xml_blob(field_value)
+    return fallback
 
 
 def _search_xml_blob(blob: str) -> str | None:
@@ -1412,63 +1485,106 @@ def _diagram_is_usable(diagram: str, graph: WorkflowGraph) -> bool:
     return present >= max(1, int(len(named) * 0.75))
 
 
-def build_arrow_diagram(graph: WorkflowGraph, width_in: float | None = None) -> str:
-    """
-    Deterministic fallback layout, used when the model is unavailable or its
-    diagram fails validation, so Section 3 always carries a figure.
+BOX_TL, BOX_TR, BOX_BL, BOX_BR = "\u250c", "\u2510", "\u2514", "\u2518"
+BOX_H, BOX_V, BOX_STEM = "\u2500", "\u2502", "\u252c"
+TEE, ELBOW, ARROW_D, ARROW_R = "\u251c", "\u2514", "\u25bc", "\u25b6"
 
-    One line per link, in execution order. Grouping a stage's targets onto one
-    line was tried first and rejected: a stage feeding four others produced a
-    170-character line, which no legible font could fit, and the whole figure was
-    dropped. A line per link is never wider than two names.
 
-    Long names are shortened to fit rather than losing the figure altogether.
+def build_flowchart(graph: WorkflowGraph, width_in: float | None = None) -> str:
+    """A top-to-bottom flowchart: a box per stage, arrows for links.
+
+    Vertical rather than left to right because a portrait page is only about a
+    hundred characters wide, which a six-deep chain of connector names overruns.
     """
-    if not graph.links or len(graph.stages) > MAX_STAGES_FOR_DIAGRAM:
+    stages = [s for s in graph.stages if s.role != ROLE_UNCLASSIFIED]
+    if not stages or not graph.links or len(stages) > MAX_STAGES_FOR_DIAGRAM:
         return ""
 
     depth: dict[str, int] = {}
 
-    def compute(stage_id: str, seen: frozenset[str]) -> int:
-        if stage_id in depth:
-            return depth[stage_id]
-        incoming = [l.from_stage for l in graph.links if l.to_stage == stage_id]
-        incoming = [i for i in incoming if i not in seen]
-        d = 0 if not incoming else 1 + max(compute(i, seen | {stage_id}) for i in incoming)
-        depth[stage_id] = d
-        return d
+    def compute(sid: str, seen: frozenset[str]) -> int:
+        if sid in depth:
+            return depth[sid]
+        prior = [l.from_stage for l in graph.links
+                 if l.to_stage == sid and l.from_stage not in seen]
+        depth[sid] = 0 if not prior else 1 + max(compute(p, seen | {sid}) for p in prior)
+        return depth[sid]
 
-    for stage in graph.stages:
+    for stage in stages:
         compute(stage.identifier, frozenset())
 
-    ordered = sorted(
-        graph.links,
-        key=lambda l: (depth.get(l.from_stage, 0), _name_of(graph, l.from_stage),
-                       _name_of(graph, l.to_stage)),
-    )
-    rows = [
-        (_name_of(graph, l.from_stage), _name_of(graph, l.to_stage), l.is_reference)
-        for l in ordered
-    ]
+    order = sorted(stages, key=lambda s: (depth[s.identifier], s.display_name))
+    position = {s.identifier: i for i, s in enumerate(order)}
+    names = {s.identifier: s.display_name for s in graph.stages}
 
-    marker = "  (reference)"
-    arrow = "  -->  "
-    usable = (width_in or CONTENT_WIDTH_IN) - 0.25
-    budget = int(72 * usable / (MONO_CHAR_WIDTH_RATIO * DIAGRAM_MIN_FONT))
+    budget = int(72 * ((width_in or CONTENT_WIDTH_IN) - 0.25)
+                 / (MONO_CHAR_WIDTH_RATIO * SIZE_DIAGRAM))
+    inner = min(max(len(s.display_name) for s in order) + 2, max(24, budget - 24))
+    stem = 4                                    # indent of the connector stem
 
+    lines: list[str] = []
+    for index, stage in enumerate(order):
+        role = ROLE_LABELS[stage.role].lower()
+        label = _ellipsize(stage.display_name, inner - 2)
+        lines.append(f"{BOX_TL}{BOX_H * inner}{BOX_TR}")
+        lines.append(f"{BOX_V} {label:<{inner - 2}} {BOX_V}  {role}")
+
+        outgoing = [l for l in graph.links if l.from_stage == stage.identifier]
+        if not outgoing:
+            lines.append(f"{BOX_BL}{BOX_H * inner}{BOX_BR}")
+            lines.append("")
+            continue
+
+        lines.append(f"{BOX_BL}{BOX_H * stem}{BOX_STEM}{BOX_H * (inner - stem - 1)}{BOX_BR}")
+
+        straight = (
+            len(outgoing) == 1
+            and position.get(outgoing[0].to_stage) == index + 1
+        )
+        if straight:
+            link = outgoing[0]
+            lines.append(f"{' ' * stem}{BOX_V}  {link.display_name}")
+            lines.append(f"{' ' * stem}{ARROW_D}")
+        else:
+            target_w = max(len(names.get(l.to_stage, l.to_stage)) for l in outgoing)
+            for i, link in enumerate(outgoing):
+                joint = ELBOW if i == len(outgoing) - 1 else TEE
+                tail = " (reference)" if link.is_reference else ""
+                target = names.get(link.to_stage, link.to_stage)
+                lines.append(
+                    f"{' ' * stem}{joint}{BOX_H}{ARROW_R} {target:<{target_w}}"
+                    f"   {link.display_name}{tail}"
+                )
+            lines.append("")
+
+    while lines and not lines[-1]:
+        lines.pop()
+    if max(len(l) for l in lines) > budget:
+        return ""
+    return "\n".join(lines)
+
+
+def build_arrow_diagram(graph: WorkflowGraph, width_in: float | None = None) -> str:
+    """A flowchart where one fits, otherwise a line per link."""
+    chart = build_flowchart(graph, width_in)
+    if chart:
+        return chart
+
+    if not graph.links or len(graph.stages) > MAX_STAGES_FOR_DIAGRAM:
+        return ""
+    rows = [(_name_of(graph, l.from_stage), _name_of(graph, l.to_stage), l.is_reference)
+            for l in graph.links]
+    marker, arrow = "  (reference)", "  -->  "
+    budget = int(72 * ((width_in or CONTENT_WIDTH_IN) - 0.25)
+                 / (MONO_CHAR_WIDTH_RATIO * DIAGRAM_MIN_FONT))
     name_w = max(len(a) for a, _, _ in rows)
-    longest = max(name_w + len(arrow) + len(b) + (len(marker) if r else 0)
-                  for _, b, r in rows for a in [""])
-    # Shorten names only as far as necessary, and only if necessary.
+    longest = max(name_w + len(arrow) + len(b) + (len(marker) if r else 0) for _, b, r in rows)
     allowed = budget - len(arrow) - len(marker)
     if longest > budget and allowed >= 16:
         limit = max(8, allowed // 2)
         rows = [(_ellipsize(a, limit), _ellipsize(b, limit), r) for a, b, r in rows]
         name_w = max(len(a) for a, _, _ in rows)
-
-    return "\n".join(
-        f"{a:<{name_w}}{arrow}{b}{marker if r else ''}" for a, b, r in rows
-    )
+    return "\n".join(f"{a:<{name_w}}{arrow}{b}{marker if r else ''}" for a, b, r in rows)
 
 
 def _ellipsize(text: str, limit: int) -> str:
@@ -1501,10 +1617,8 @@ def _validate_narrative(narrative: Narrative, graph: WorkflowGraph) -> list[str]
 # the output matches the approved draft rather than Word's built-in styling.
 
 # --- Content normalisation ---------------------------------------------------
-# GPT-4o writes markdown, writes longer than it is asked to, and wraps text
-# across lines. DataStage carries names of arbitrary length. Everything that
-# reaches the page goes through these first, so the layout does not depend on
-# either behaving.
+# The model writes markdown, runs long, and wraps lines. Everything reaching the
+# page goes through these first.
 
 # Underscore markdown is deliberately NOT handled. DataStage technical names are
 # full of underscores, and treating them as emphasis markers silently rewrites
@@ -1519,20 +1633,22 @@ _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 ZERO_WIDTH_SPACE = "\u200b"
 
 
-def clean_text(text: Any) -> str:
-    """Strip markdown, normalise whitespace, and flatten to a single line.
+def clean_text(text: Any, markdown: bool = False) -> str:
+    """Normalise whitespace and flatten to a single line.
 
-    A newline inside a run does nothing in Word, so an unflattened multi-line
-    description would render with its words run together.
+    Markdown is stripped only from model-written text. Doing it everywhere ate
+    the leading # of labels such as "# of sources", which are report headings,
+    not markdown.
     """
     if text is None:
         return ""
     out = str(text)
-    out = _MD_HEADING_RE.sub("", out)
-    out = _MD_BULLET_RE.sub("", out)
-    out = _MD_CODE_RE.sub(r"\1", out)
-    out = _MD_BOLD_RE.sub(r"\1", out)
-    out = _MD_ITALIC_RE.sub(r"\1", out)
+    if markdown:
+        out = _MD_HEADING_RE.sub("", out)
+        out = _MD_BULLET_RE.sub("", out)
+        out = _MD_CODE_RE.sub(r"\1", out)
+        out = _MD_BOLD_RE.sub(r"\1", out)
+        out = _MD_ITALIC_RE.sub(r"\1", out)
     out = out.replace("\u00a0", " ")
     # Joining lines needs punctuation, otherwise former bullet points run
     # together into one unreadable sentence.
@@ -1558,24 +1674,39 @@ def truncate_at_sentence(text: str, limit: int) -> str:
     return f"{cut}{TRUNCATION_MARK}"
 
 
-def soften_long_tokens(text: str, after: int = LONG_TOKEN_BREAK_AFTER) -> str:
-    """Insert zero-width spaces inside long unbroken tokens.
+# Word may break after these. It will not break mid-word, which is what makes a
+# long name overflow its column.
+_TOKEN_SEPARATORS = "_.:/\\-|,"
 
-    Word will not break a word that has no space or hyphen in it. Without a
-    break opportunity a long technical name overflows its cell and widens the
-    column, which is what pushes a table past the page margin.
+
+def soften_long_tokens(text: str, after: int = LONG_TOKEN_BREAK_AFTER) -> str:
+    """Let Word wrap long identifiers at their own separators.
+
+    EDW_STG.CUSTOMER_DELTA gets break points after each _ and . so it wraps as
+    whole words. Only a run with no separator at all is split by length, and
+    only once it is longer than any column could show.
     """
     if not text:
         return ""
 
-    def split(match: re.Match) -> str:
+    def soften(match: re.Match) -> str:
         token = match.group(0)
-        if len(token) <= after:
+        if len(token) <= 8:
             return token
-        parts = [token[i : i + after] for i in range(0, len(token), after)]
-        return ZERO_WIDTH_SPACE.join(parts)
+        out: list[str] = []
+        run = ""
+        for ch in token:
+            run += ch
+            if ch in _TOKEN_SEPARATORS:
+                out.append(run + ZERO_WIDTH_SPACE)
+                run = ""
+            elif len(run) >= after:
+                out.append(run + ZERO_WIDTH_SPACE)
+                run = ""
+        out.append(run)
+        return "".join(out).rstrip(ZERO_WIDTH_SPACE)
 
-    return re.sub(r"\S{%d,}" % (after + 1), split, text)
+    return re.sub(r"\S+", soften, text)
 
 
 def limit_prose(text: str) -> list[str]:
@@ -1583,7 +1714,7 @@ def limit_prose(text: str) -> list[str]:
     a talkative model cannot push the next section onto another page."""
     if not text:
         return []
-    blocks = [clean_text(b) for b in re.split(r"\n\s*\n|\n", str(text)) if b.strip()]
+    blocks = [clean_text(b, markdown=True) for b in re.split(r"\n\s*\n|\n", str(text)) if b.strip()]
     blocks = [b for b in blocks if b][:MAX_PROSE_PARAGRAPHS]
     kept: list[str] = []
     budget = MAX_PROSE_CHARS
@@ -2134,7 +2265,8 @@ class DocxBuilder:
                 _cell_margins(cell, TABLE_CELL_PAD_TWIPS)
 
                 text, kind = (value if isinstance(value, tuple) else (value, None))
-                text = clean_text(text)
+                # Only description cells hold model-written text.
+                text = clean_text(text, markdown=idx in desc_columns and not header)
                 if not header and idx in limits:
                     text = truncate_at_sentence(text, limits[idx])
                 text = soften_long_tokens(text)
@@ -2181,6 +2313,11 @@ class DocxBuilder:
 
     # -- sections -------------------------------------------------------------
 
+    def _page_break(self) -> None:
+        para = self.doc.add_paragraph()
+        para.add_run().add_break(WD_BREAK.PAGE)
+        _set_paragraph(para, space_before=0, space_after=0)
+
     def build(self) -> Document:
         self._override_template_defaults()
         if TRIM_TEMPLATE_TRAILING_EMPTY_PARAGRAPHS:
@@ -2190,21 +2327,43 @@ class DocxBuilder:
         self._start_report_page()
         self._build_running_header_footer()
 
-        self._section_contents()
-        self._section_1_overview()
-        self._section_2_stages()
-        self._section_3_architecture()
-        self._section_4_sources()
-        self._section_5_transformations()
-        self._section_6_references()
-        self._section_7_targets()
-        self._section_8_paths()
-        self._section_9_observations()
+        sections = self._sections_with_content()
+        self._contents([title for title, _ in sections])
+
+        for number, (title, emit) in enumerate(sections, start=1):
+            if SECTION_STARTS_NEW_PAGE:
+                self._page_break()
+            self._heading(f"Section {number}", title)
+            emit()
         return self.doc
 
-    def _section_contents(self) -> None:
+    def _sections_with_content(self) -> list[tuple[str, Any]]:
+        """Sections are numbered as they appear, so a report has no gaps."""
+        g = self.graph
+        has_architecture = bool(
+            self.narrative.architecture_diagram
+            or self.narrative.architecture_description
+            or build_arrow_diagram(g, self.content_width)
+        )
+        candidates = [
+            ("Workflow Overview", self._overview, True),
+            ("Workflow Stages", self._stages, bool(g.stages)),
+            ("Workflow Architecture", self._architecture, has_architecture),
+            ("Sources", self._sources, bool(g.sources)),
+            ("Transformations", self._transformations, bool(g.transformations)),
+            ("References", self._references, bool(g.references)),
+            ("Targets", self._targets, bool(g.targets)),
+            ("Data Path", self._paths, bool(g.paths)),
+            ("Observations", self._observations,
+             bool(g.observations or self.narrative.unverified_identifiers)),
+        ]
+        if not SKIP_EMPTY_SECTIONS:
+            return [(t, f) for t, f, _ in candidates]
+        return [(t, f) for t, f, present in candidates if present]
+
+    def _contents(self, titles: Sequence[str]) -> None:
         self._heading(CONTENTS_EYEBROW, CONTENTS_HEADING, first=True)
-        for number, title in SECTION_TITLES.items():
+        for number, title in enumerate(titles, start=1):
             para = self.doc.add_paragraph()
             _set_paragraph(para, space_before=0, space_after=4, line_spacing=1.0)
             label = para.add_run(f"Section {number}")
@@ -2214,36 +2373,32 @@ class DocxBuilder:
             name = para.add_run(title)
             _set_run(name, FONT_SERIF, SIZE_TOC, color=COLOR_INK)
 
-    def _section_1_overview(self) -> None:
+    def _overview(self) -> None:
         g = self.graph
-        self._heading("Section 1", SECTION_TITLES[1])
         rows = [
             ("Filename", g.job.source_file),
             ("# of sources", str(len(g.sources))),
             ("# of targets", str(len(g.targets))),
             ("# of references", str(len(g.references))),
             ("# of transformations", str(len(g.transformations))),
-            (
-                "# of total stages",
-                str(len(g.sources) + len(g.references) + len(g.transformations) + len(g.targets)),
-            ),
+            ("# of total stages",
+             str(len(g.sources) + len(g.references) + len(g.transformations) + len(g.targets))),
         ]
         self._table(None, rows, [2.20, self.content_width - 2.20],
                     mono_columns=[1], key_column=0)
         self._caption("Workflow overview")
 
-    def _section_2_stages(self) -> None:
-        self._heading("Section 2", SECTION_TITLES[2])
+    def _stages(self) -> None:
         rows = []
         for s in self.graph.stages:
-            role = ROLE_LABELS.get(s.role, s.role)
             rows.append([
                 s.identifier,
                 s.display_name if s.name else (TEXT_NOT_IDENTIFIED, "na"),
                 s.display_type,
                 str(len(s.inputs)),
                 str(len(s.outputs)),
-                role if s.role != ROLE_UNCLASSIFIED else (TEXT_NOT_APPLICABLE, "na"),
+                ROLE_LABELS[s.role] if s.role != ROLE_UNCLASSIFIED
+                else (TEXT_NOT_APPLICABLE, "na"),
             ])
         self._table(
             ["ID", "Technical name", "Type", "# input links", "# output links", "Role"],
@@ -2253,8 +2408,7 @@ class DocxBuilder:
         )
         self._caption("Workflow stages and data objects")
 
-    def _section_3_architecture(self) -> None:
-        self._heading("Section 3", SECTION_TITLES[3])
+    def _architecture(self) -> None:
         fitted = fit_diagram(self.narrative.architecture_diagram, self.content_width)
         if fitted is None:
             fitted = fit_diagram(build_arrow_diagram(self.graph, self.content_width),
@@ -2262,35 +2416,23 @@ class DocxBuilder:
         if fitted:
             diagram, size = fitted
             self._monospace_block(diagram, size)
-            self._figure_caption("Figure 1 · Workflow architecture")
-        else:
-            # Reached when the workflow is too wide to draw, or when the stage
-            # names are long enough that no legible font fits the page.
-            self._prose(
-                f"The workflow contains {len(self.graph.stages)} stages and cannot be "
-                "presented legibly as a diagram at the width of this page. Section 2 lists "
-                "every stage and its links, and Section 8 lists the paths between them."
-            )
+            self._figure_caption("Figure 1 \u00b7 Workflow architecture")
         self._prose(self.narrative.architecture_description)
 
     def _entity_description(self, stage: Stage) -> Any:
         text = self.narrative.entity_descriptions.get(stage.display_name, "").strip()
         return text if text else (TEXT_NOT_IDENTIFIED, "na")
 
-    def _section_4_sources(self) -> None:
-        self._heading("Section 4", SECTION_TITLES[4])
+    def _sources(self) -> None:
         rows = []
         for s in self.graph.sources:
             obj = stage_object(s)
-            out_links = ", ".join(s.outputs) or TEXT_NOT_APPLICABLE
             rows.append([
                 s.display_name, s.identifier, s.display_type,
                 obj if obj else (TEXT_NOT_IDENTIFIED, "na"),
-                out_links,
+                ", ".join(s.outputs) or TEXT_NOT_APPLICABLE,
                 self._entity_description(s),
             ])
-        if not rows:
-            rows = [[(TEXT_NOT_IDENTIFIED, "na"), "", "", "", "", ""]]
         self._table(
             ["Technical name", "ID", "Type", "Object", "Output link", "Description"],
             rows,
@@ -2299,17 +2441,12 @@ class DocxBuilder:
         )
         self._caption("Sources")
 
-    def _section_5_transformations(self) -> None:
-        self._heading("Section 5", SECTION_TITLES[5])
-        rows = []
-        for s in self.graph.transformations:
-            rows.append([
-                s.display_name, s.identifier, s.display_type,
-                f"{len(s.inputs)} / {len(s.outputs)}",
-                self._entity_description(s),
-            ])
-        if not rows:
-            rows = [[(TEXT_NOT_IDENTIFIED, "na"), "", "", "", ""]]
+    def _transformations(self) -> None:
+        rows = [[
+            s.display_name, s.identifier, s.display_type,
+            f"{len(s.inputs)} / {len(s.outputs)}",
+            self._entity_description(s),
+        ] for s in self.graph.transformations]
         self._table(
             ["Technical name", "ID", "Type", "In / Out", "Description"],
             rows,
@@ -2318,20 +2455,16 @@ class DocxBuilder:
         )
         self._caption("Transformations")
 
-    def _section_6_references(self) -> None:
-        self._heading("Section 6", SECTION_TITLES[6])
+    def _references(self) -> None:
         rows = []
         for s in self.graph.references:
             used_by = ", ".join(
-                sorted({_name_of(self.graph, l.to_stage) for l in self.graph.outgoing(s)})
-            )
+                sorted({_name_of(self.graph, l.to_stage) for l in self.graph.outgoing(s)}))
             rows.append([
                 s.display_name, s.identifier, s.display_type,
                 used_by if used_by else (TEXT_NOT_IDENTIFIED, "na"),
                 self._entity_description(s),
             ])
-        if not rows:
-            rows = [[(TEXT_NOT_APPLICABLE, "na"), "", "", "", ""]]
         self._table(
             ["Technical name", "ID", "Type", "Used by", "Description"],
             rows,
@@ -2340,8 +2473,7 @@ class DocxBuilder:
         )
         self._caption("References")
 
-    def _section_7_targets(self) -> None:
-        self._heading("Section 7", SECTION_TITLES[7])
+    def _targets(self) -> None:
         rows = []
         for s in self.graph.targets:
             obj = stage_object(s)
@@ -2352,8 +2484,6 @@ class DocxBuilder:
                 mode if mode else (TEXT_NOT_IDENTIFIED, "na"),
                 self._entity_description(s),
             ])
-        if not rows:
-            rows = [[(TEXT_NOT_IDENTIFIED, "na"), "", "", "", "", ""]]
         self._table(
             ["Technical name", "ID", "Type", "Object", "Write mode", "Description"],
             rows,
@@ -2362,19 +2492,14 @@ class DocxBuilder:
         )
         self._caption("Targets")
 
-    def _section_8_paths(self) -> None:
-        self._heading("Section 8", SECTION_TITLES[8])
+    def _paths(self) -> None:
         rows = []
         for i, path in enumerate(self.graph.paths, start=1):
             explanation = self.narrative.path_explanations.get(i, "").strip()
             rows.append([
-                str(i),
-                " → ".join(path),
-                str(len(path)),
+                str(i), " \u2192 ".join(path), str(len(path)),
                 explanation if explanation else (TEXT_NOT_IDENTIFIED, "na"),
             ])
-        if not rows:
-            rows = [[(TEXT_NOT_APPLICABLE, "na"), "", "", ""]]
         self._table(
             ["#", "Path", "Stages in path", "Explanation"],
             rows,
@@ -2385,24 +2510,18 @@ class DocxBuilder:
         self._caption("Data paths")
         self._prose(self.narrative.path_summary)
 
-    def _section_9_observations(self) -> None:
-        self._heading("Section 9", SECTION_TITLES[9])
-        rows = []
-        for o in self.graph.observations:
-            rows.append([
-                o.ref, o.category,
-                o.obj if o.obj != TEXT_NOT_APPLICABLE else (TEXT_NOT_APPLICABLE, "na"),
-                o.text,
-            ])
+    def _observations(self) -> None:
+        rows = [[
+            o.ref, o.category,
+            o.obj if o.obj != TEXT_NOT_APPLICABLE else (TEXT_NOT_APPLICABLE, "na"),
+            o.text,
+        ] for o in self.graph.observations]
         for ident in self.narrative.unverified_identifiers:
             rows.append([
                 f"OBS-{len(rows) + 1:02d}", "Unverified reference", ident,
-                f"The descriptive text refers to {ident}, which does not appear in the export. "
-                "The reference could not be verified against the source file.",
+                f"The descriptive text refers to {ident}, which does not appear in the "
+                "export. The reference could not be verified against the source file.",
             ])
-        if not rows:
-            rows = [["OBS-01", "Completeness", (TEXT_NOT_APPLICABLE, "na"),
-                     "No exceptions were recorded during analysis."]]
         self._table(
             ["Ref", "Category", "Object", "Observation"],
             rows,
@@ -2415,9 +2534,9 @@ class DocxBuilder:
 # =============================================================================
 # SECTION F   PDF CONVERSION
 # =============================================================================
-# docx2pdf drives Microsoft Word through COM. Three things break in production,
-# in this order: COM is not initialised on the worker thread, Word is not
-# concurrent, and a crash leaves WINWORD.EXE resident.
+# docx2pdf drives Word through COM. Three things break in production: COM not
+# initialised on the worker thread, Word not being concurrent, and stray
+# WINWORD.EXE after a crash.
 
 _WORD_LOCK = threading.Lock()
 
